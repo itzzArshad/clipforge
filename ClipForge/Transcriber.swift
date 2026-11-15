@@ -2,17 +2,18 @@ import Foundation
 import WhisperKit
 
 struct RawWord {
-    let text: String
-    let start: Double
-    let end: Double
+    var text: String
+    var start: Double
+    var end: Double
 }
 
 /// On-device Whisper via WhisperKit (Core ML). First use downloads the model from Hugging Face.
-final class Transcriber {
+actor Transcriber {
     private var pipe: WhisperKit?
     private var loadedModel: String?
 
-    func words(samples: [Float], model: String, language: String) async throws -> [RawWord] {
+    func words(samples: [Float], model: String, language: String, offset: Double = 0) async throws -> [RawWord] {
+        guard !samples.isEmpty else { return [] }
         if pipe == nil || loadedModel != model {
             pipe = try await WhisperKit(WhisperKitConfig(model: model))
             loadedModel = model
@@ -31,7 +32,7 @@ final class Transcriber {
                 for w in seg.words ?? [] {
                     let t = w.word.trimmingCharacters(in: .whitespacesAndNewlines)
                     if t.isEmpty { continue }
-                    out.append(RawWord(text: t, start: Double(w.start), end: Double(w.end)))
+                    out.append(RawWord(text: t, start: Double(w.start) + offset, end: Double(w.end) + offset))
                 }
             }
         }

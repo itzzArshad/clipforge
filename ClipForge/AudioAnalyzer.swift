@@ -29,7 +29,7 @@ enum AudioAnalyzer {
         ]
     }
 
-    private static func floats(from sb: CMSampleBuffer) -> [Float] {
+    static func floats(from sb: CMSampleBuffer) -> [Float] {
         guard let block = CMSampleBufferGetDataBuffer(sb) else { return [] }
         let length = CMBlockBufferGetDataLength(block)
         var data = [Float](repeating: 0, count: length / MemoryLayout<Float>.size)

@@ -16,11 +16,12 @@ enum ExportError: LocalizedError {
 struct BuiltClip {
     let comp: AVMutableComposition
     let trackID: CMPersistentTrackID
-    let orientation: CGImagePropertyOrientation
+    let keep: [ClosedRange<Double>]   // source-time ranges that were kept (silences cut)
 }
 
 enum Exporter {
-    static let target = CGSize(width: 1080, height: 1920)
+    static let exportSize = CGSize(width: 1080, height: 1920)
+    static let previewSize = CGSize(width: 540, height: 960)
 
     static func orientation(for t: CGAffineTransform) -> CGImagePropertyOrientation {
         switch (t.a, t.b, t.c, t.d) {
@@ -31,12 +32,10 @@ enum Exporter {
         }
     }
 
-    /// Stitches the kept ranges (silences removed) into one composition.
     static func build(url: URL, keep: [ClosedRange<Double>]) async throws -> BuiltClip {
         let asset = AVURLAsset(url: url)
         guard let vTrack = try await asset.loadTracks(withMediaType: .video).first else { throw ExportError.noVideo }
         let aTrack = try await asset.loadTracks(withMediaType: .audio).first
-        let pt = try await vTrack.load(.preferredTransform)
 
         let comp = AVMutableComposition()
         guard let cv = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
@@ -55,28 +54,40 @@ enum Exporter {
             if let aTrack, let ca { try ca.insertTimeRange(range, of: aTrack, at: cursor) }
             cursor = cursor + range.duration
         }
-        return BuiltClip(comp: comp, trackID: cv.trackID, orientation: orientation(for: pt))
+        return BuiltClip(comp: comp, trackID: cv.trackID, keep: keep)
     }
 
-    static func render(_ built: BuiltClip, config: ReelConfig) async throws -> URL {
-        let comp = built.comp
+    static func videoComposition(for b: BuiltClip, state: ReelState, size: CGSize) -> AVMutableVideoComposition {
         let vc = AVMutableVideoComposition()
         vc.customVideoCompositorClass = ReelCompositor.self
-        vc.renderSize = target
+        vc.renderSize = size
         vc.frameDuration = CMTime(value: 1, timescale: 30)
         vc.instructions = [
-            ReelInstruction(timeRange: CMTimeRange(start: .zero, duration: comp.duration),
-                            trackID: built.trackID, config: config)
+            ReelInstruction(timeRange: CMTimeRange(start: .zero, duration: b.comp.duration),
+                            trackID: b.trackID, state: state)
         ]
+        return vc
+    }
 
+    static func export(_ b: BuiltClip, state: ReelState,
+                       onProgress: @escaping @MainActor (Double) -> Void) async throws -> URL {
+        let vc = videoComposition(for: b, state: state, size: exportSize)
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("clip-\(UUID().uuidString).mp4")
-        guard let session = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetHighestQuality) else {
+        guard let session = AVAssetExportSession(asset: b.comp, presetName: AVAssetExportPresetHighestQuality) else {
             throw ExportError.failed
         }
         session.videoComposition = vc
         session.outputURL = out
         session.outputFileType = .mp4
+        let poll = Task {
+            while !Task.isCancelled {
+                let p = Double(session.progress)
+                await MainActor.run { onProgress(p) }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
         await session.export()
+        poll.cancel()
         guard session.status == .completed else { throw session.error ?? ExportError.failed }
         return out
     }

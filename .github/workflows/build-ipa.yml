@@ -6,8 +6,8 @@ on:
 
 jobs:
   build:
-    # If package resolution complains about the Swift tools version, change to: macos-26
-    runs-on: macos-15
+    # macos-26 = Xcode 26 SDK, needed for real Liquid Glass (falls back to frosted material on older SDKs)
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

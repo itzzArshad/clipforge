@@ -1,18 +1,21 @@
-# ClipForge v0.2
+# ClipForge v0.3
 
-Long video -> vertical reel, on the phone.
+Editor-style short-form maker for iPhone.
 
-- Finds loud/hype moments (language independent), trim, cut silences
-- Layouts: **Fit + blur** (full frame, nothing cropped, blurred fill behind) or **Fill** (crop with pan)
-- Captions: WhisperKit (on-device) with word timestamps, Hindi + other Indian languages
-- Signature look ("Hype mode"): captions react to how loud each word is (loud words get bigger and hot-coloured, the active word pops),
-  punch-in zoom on shouts, and a live hype meter bar driven by the streamer's audio, plus an optional hook line
+- Live 9:16 preview: layout, background, captions and effects update instantly
+- Layouts: Fit (full frame in a rounded card) with Aura / Blur / Black backgrounds, or Fill (crop with pan)
+- Moment finding, two ways + a mix:
+  - Loud: loudest windows (language independent, runs on the whole file)
+  - Speech: transcribes the top loud windows with Whisper and scores the text (excitement words, speech rate, repeats, "!" "?", laughter)
+  - Best: blend of both; optional Claude "AI rank" with a hook title per moment
+- Captions: Pill / Pop / Clean styles, per-script fonts (Devanagari, Telugu, Tamil, ...), word-by-word highlight, shouted words turn hot red
+- Hype mode: punch-in zoom on shouts, live hype meter, hook sticker for the first 2.5 s
+- Liquid Glass UI (iOS 26, built with Xcode 26 on the macos-26 runner)
 
 ## Build
-Push to GitHub (public repo = free macOS minutes) -> Actions -> "Build unsigned IPA" -> download artifact -> sign with Feather.
-Set PRODUCT_BUNDLE_IDENTIFIER in project.yml to match your profile if needed.
+Push to GitHub -> Actions -> "Build unsigned IPA" -> download artifact -> sign with Feather.
 
 ## Notes
-- First caption run downloads the Whisper model from Hugging Face (needs internet). "small" is fast; the accurate model is much better on Hinglish but slower and warmer.
-- First load of a model compiles it for the Neural Engine and can take a minute or more. Later runs are faster.
-- Silence threshold is -40 dBFS in AudioAnalyzer.keepRanges.
+- Captions / speech analysis download a Whisper model on first use (internet needed).
+- AI rank needs your own Anthropic API key (Settings). Only transcript text is sent.
+- Silence threshold: -40 dBFS in AudioAnalyzer.keepRanges. Excitement words: TextScorer.lexicon in Moments.swift.

@@ -17,216 +17,238 @@ struct VideoFile: Transferable {
     }
 }
 
-struct Lang: Identifiable, Hashable {
-    let code: String
-    let name: String
-    var id: String { code }
-}
-
-let languages: [Lang] = [
-    Lang(code: "hi", name: "Hindi"), Lang(code: "en", name: "English"),
-    Lang(code: "te", name: "Telugu"), Lang(code: "ta", name: "Tamil"),
-    Lang(code: "kn", name: "Kannada"), Lang(code: "ml", name: "Malayalam"),
-    Lang(code: "mr", name: "Marathi"), Lang(code: "bn", name: "Bengali"),
-    Lang(code: "gu", name: "Gujarati"), Lang(code: "pa", name: "Punjabi"),
-    Lang(code: "ur", name: "Urdu")
-]
-
 struct ContentView: View {
+    @State private var model = EditorModel()
     @State private var pickerItem: PhotosPickerItem?
+    @State private var showPhotos = false
     @State private var showFiles = false
-    @State private var videoURL: URL?
-    @State private var duration: Double = 0
-    @State private var bins: [Float] = []
-    @State private var highlights: [Highlight] = []
-    @State private var start: Double = 0
-    @State private var end: Double = 30
-    @State private var removeSilence = true
-    @State private var status = "Pick a video to begin"
-    @State private var busy = false
-    @State private var player = AVPlayer()
-
-    // reel style
-    @State private var layout: ReelLayout = .fit
-    @State private var panX: Double = 0.5
-    @State private var captions = true
-    @State private var punch = true
-    @State private var hype = true
-    @State private var hook = ""
-    @State private var language = "hi"
-    @State private var accurateModel = false
-
-    @State private var transcriber = Transcriber()
+    @State private var showSettings = false
+    @State private var tab: EditorTab = .moments
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    PhotosPicker(selection: $pickerItem, matching: .videos) {
-                        Label("Pick from Photos", systemImage: "photo.on.rectangle")
-                    }
-                    Button { showFiles = true } label: {
-                        Label("Pick from Files", systemImage: "folder")
-                    }
-                }
+        ZStack {
+            AmbientBackground()
 
-                if videoURL != nil {
-                    Section("Preview") {
-                        VideoPlayer(player: player).frame(height: 240)
-                    }
-                    Section("Candidates (loudest moments)") {
-                        ForEach(highlights) { h in
-                            Button { select(h) } label: {
-                                HStack {
-                                    Text("\(fmt(h.start)) – \(fmt(h.end))")
-                                    Spacer()
-                                    Text(String(format: "%.0f", h.score)).foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                    Section("Trim  (\(fmt(start)) – \(fmt(end)))") {
-                        Slider(value: $start, in: 0...max(duration - 1, 1))
-                            .onChange(of: start) { _, v in
-                                if end < v + 1 { end = min(v + 1, duration) }
-                                seek(v)
-                            }
-                        Slider(value: $end, in: (start + 1)...max(duration, start + 2))
-                        Toggle("Remove silences", isOn: $removeSilence)
-                    }
-                    Section("Look") {
-                        Picker("Layout", selection: $layout) {
-                            ForEach(ReelLayout.allCases) { Text($0.rawValue).tag($0) }
-                        }.pickerStyle(.segmented)
-                        if layout == .fill {
-                            VStack(alignment: .leading) {
-                                Text("Crop position (left → right)").font(.footnote)
-                                Slider(value: $panX, in: 0...1)
-                            }
-                        }
-                        Toggle("Punch-in zoom on loud moments", isOn: $punch)
-                        Toggle("Hype meter bar", isOn: $hype)
-                        TextField("Hook text (first 2.5 s, optional)", text: $hook)
-                    }
-                    Section("Captions") {
-                        Toggle("Burn in captions", isOn: $captions)
-                        if captions {
-                            Picker("Spoken language", selection: $language) {
-                                ForEach(languages) { Text($0.name).tag($0.code) }
-                            }
-                            Toggle("Accurate model (slower, ~600 MB download)", isOn: $accurateModel)
-                        }
-                    }
-                    Section {
-                        Button { Task { await export() } } label: {
-                            Text("Make reel → Photos").bold()
-                        }.disabled(busy)
-                    }
-                }
+            if model.hasVideo {
+                EditorScreen(model: model, tab: $tab,
+                             onPhotos: { showPhotos = true },
+                             onFiles: { showFiles = true },
+                             onSettings: { showSettings = true })
+            } else {
+                WelcomeScreen(onPhotos: { showPhotos = true }, onFiles: { showFiles = true })
+            }
 
-                Section { Text(status).font(.footnote).foregroundStyle(.secondary) }
+            if let text = model.busyText {
+                BusyOverlay(text: text, progress: model.progress,
+                            onCancel: model.analyzing ? { model.cancelAnalysis() } : nil)
+                    .transition(.opacity)
             }
-            .navigationTitle("ClipForge")
-            .onChange(of: pickerItem) { _, item in
-                guard let item else { return }
-                Task {
-                    status = "Importing…"
-                    if let f = try? await item.loadTransferable(type: VideoFile.self) {
-                        await load(f.url)
-                    } else {
-                        status = "Could not import that video"
-                    }
+
+            VStack {
+                if let t = model.toast {
+                    Text(t)
+                        .font(.system(size: 14, weight: .semibold))
+                        .padding(.horizontal, 16).padding(.vertical, 10)
+                        .glass(22)
+                        .transition(.move(edge: .top).combined(with: .opacity))
                 }
+                Spacer()
             }
-            .fileImporter(isPresented: $showFiles, allowedContentTypes: [.movie]) { result in
-                guard case .success(let url) = result else { return }
+            .padding(.top, 6)
+            .allowsHitTesting(false)
+        }
+        .animation(.snappy, value: model.toast)
+        .animation(.snappy, value: model.busyText)
+        .preferredColorScheme(.dark)
+        .photosPicker(isPresented: $showPhotos, selection: $pickerItem, matching: .videos)
+        .onChange(of: pickerItem) { _, item in
+            guard let item else { return }
+            Task {
+                model.busyText = "Importing video…"
+                if let f = try? await item.loadTransferable(type: VideoFile.self) {
+                    await model.importVideo(f.url)
+                } else {
+                    model.busyText = nil
+                    model.show("Could not import that video")
+                }
+                pickerItem = nil
+            }
+        }
+        .fileImporter(isPresented: $showFiles, allowedContentTypes: [.movie]) { result in
+            guard case .success(let url) = result else { return }
+            Task {
+                model.busyText = "Copying video…"
                 let ok = url.startAccessingSecurityScopedResource()
                 defer { if ok { url.stopAccessingSecurityScopedResource() } }
                 let dest = FileManager.default.temporaryDirectory
                     .appendingPathComponent(UUID().uuidString + "." + url.pathExtension)
-                do { try FileManager.default.copyItem(at: url, to: dest) }
-                catch { status = "Copy failed: \(error.localizedDescription)"; return }
-                Task { await load(dest) }
+                do {
+                    try await Task.detached { try FileManager.default.copyItem(at: url, to: dest) }.value
+                } catch {
+                    model.busyText = nil
+                    model.show("Copy failed: \(error.localizedDescription)")
+                    return
+                }
+                await model.importVideo(dest)
             }
         }
+        .sheet(isPresented: $showSettings) { SettingsSheet() }
     }
+}
 
-    func load(_ url: URL) async {
-        busy = true
-        status = "Analyzing audio…"
-        do {
-            let asset = AVURLAsset(url: url)
-            duration = try await asset.load(.duration).seconds
-            videoURL = url
-            player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
-            bins = try await AudioAnalyzer.loudness(url: url)
-            highlights = AudioAnalyzer.highlights(bins: bins)
-            if let first = highlights.first {
-                select(first)
-            } else {
-                start = 0
-                end = min(60, duration)
+// MARK: Welcome
+
+struct WelcomeScreen: View {
+    let onPhotos: () -> Void
+    let onFiles: () -> Void
+
+    var body: some View {
+        VStack(spacing: 22) {
+            Spacer()
+            VStack(spacing: 10) {
+                Image(systemName: "scissors.badge.ellipsis")
+                    .font(.system(size: 44, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                Text("ClipForge").font(.system(size: 34, weight: .heavy, design: .rounded))
+                Text("Turn long streams into reels.\nFinds the wild moments, captions them, makes them pop.")
+                    .font(.system(size: 15)).multilineTextAlignment(.center)
+                    .foregroundStyle(.white.opacity(0.7))
             }
-            status = "Found \(highlights.count) candidate moments"
-        } catch {
-            status = "Error: \(error.localizedDescription)"
-        }
-        busy = false
-    }
-
-    func select(_ h: Highlight) {
-        start = h.start
-        end = min(h.end, duration)
-        seek(start)
-    }
-
-    func seek(_ t: Double) {
-        player.seek(to: CMTime(seconds: t, preferredTimescale: 600),
-                    toleranceBefore: .zero, toleranceAfter: .zero)
-    }
-
-    func export() async {
-        guard let url = videoURL else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            status = "Cutting…"
-            let keep = removeSilence
-                ? AudioAnalyzer.keepRanges(bins: bins, start: start, end: end)
-                : [start...end]
-            let built = try await Exporter.build(url: url, keep: keep)
-
-            status = "Analyzing the edited clip…"
-            let samples = try await AudioAnalyzer.samples(asset: built.comp)
-            let clipBins = AudioAnalyzer.bins(fromSamples: samples)
-            let levels = AudioAnalyzer.levels(bins: clipBins)
-
-            var pages: [CaptionPage] = []
-            if captions && !samples.isEmpty {
-                status = "Transcribing… (first run downloads the model)"
-                let raw = try await transcriber.words(
-                    samples: samples,
-                    model: accurateModel ? "large-v3-v20240930_626MB" : "small",
-                    language: language)
-                pages = CaptionBuilder.pages(from: CaptionBuilder.words(from: raw, norm: levels.norm))
+            VStack(spacing: 12) {
+                Button(action: onPhotos) {
+                    Label("Choose from Photos", systemImage: "photo.on.rectangle")
+                        .font(.system(size: 17, weight: .semibold))
+                        .frame(maxWidth: .infinity).frame(height: 54)
+                        .glass(27, tint: Theme.accent, interactive: true)
+                }
+                Button(action: onFiles) {
+                    Label("Choose from Files", systemImage: "folder")
+                        .font(.system(size: 17, weight: .semibold))
+                        .frame(maxWidth: .infinity).frame(height: 54)
+                        .glass(27, interactive: true)
+                }
             }
-
-            status = "Rendering…"
-            let cfg = ReelConfig(layout: layout, panX: panX, punch: punch, hype: hype,
-                                 hookText: hook.trimmingCharacters(in: .whitespaces),
-                                 showCaptions: captions, orientation: built.orientation,
-                                 levels: levels, pages: pages)
-            let out = try await Exporter.render(built, config: cfg)
-            try await Exporter.saveToPhotos(out)
-            try? FileManager.default.removeItem(at: out)
-            status = "Saved to Photos ✓  (\(pages.count) caption pages)"
-        } catch {
-            status = "Failed: \(error.localizedDescription)"
+            .buttonStyle(.plain)
+            .padding(.horizontal, 28)
+            Spacer()
         }
     }
+}
 
-    func fmt(_ t: Double) -> String {
-        let s = Int(t)
-        return String(format: "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
+// MARK: Editor
+
+struct EditorScreen: View {
+    @Bindable var model: EditorModel
+    @Binding var tab: EditorTab
+    let onPhotos: () -> Void
+    let onFiles: () -> Void
+    let onSettings: () -> Void
+
+    var body: some View {
+        VStack(spacing: 10) {
+            topBar
+            PreviewCard(model: model)
+            TimelineSection(model: model)
+            ToolPanel(model: model, tab: $tab, onSettings: onSettings)
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 4)
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 8) {
+            Menu {
+                Button("From Photos", systemImage: "photo.on.rectangle", action: onPhotos)
+                Button("From Files", systemImage: "folder", action: onFiles)
+            } label: {
+                Image(systemName: "plus").font(.system(size: 17, weight: .semibold))
+                    .frame(width: 44, height: 44).glass(22, interactive: true)
+            }
+            Button(action: onSettings) {
+                Image(systemName: "gearshape.fill").font(.system(size: 16, weight: .semibold))
+                    .frame(width: 44, height: 44).glass(22, interactive: true)
+            }
+            .buttonStyle(.plain)
+            Spacer()
+            Button { Task { await model.export() } } label: {
+                Label("Export", systemImage: "arrow.up.circle.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .padding(.horizontal, 16).frame(height: 44)
+                    .glass(22, tint: Theme.accent, interactive: true)
+            }
+            .buttonStyle(.plain)
+        }
+        .foregroundStyle(.white)
+    }
+}
+
+struct PreviewCard: View {
+    @Bindable var model: EditorModel
+
+    var body: some View {
+        PlayerView(player: model.player)
+            .aspectRatio(9.0 / 16.0, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous)
+                .strokeBorder(.white.opacity(0.14), lineWidth: 1))
+            .overlay(alignment: .bottom) { playbackBar }
+            .contentShape(Rectangle())
+            .onTapGesture { model.togglePlay() }
+            .shadow(color: .black.opacity(0.4), radius: 24, y: 10)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var playbackBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: model.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 13))
+            ProgressView(value: min(model.playhead / max(model.clipDuration, 0.1), 1)).tint(.white)
+            Text("\(clock(model.playhead)) / \(clock(model.clipDuration))")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .glass(20)
+        .padding(10)
+        .allowsHitTesting(false)
+    }
+}
+
+struct ToolPanel: View {
+    @Bindable var model: EditorModel
+    @Binding var tab: EditorTab
+    let onSettings: () -> Void
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 4) {
+                ForEach(EditorTab.allCases) { t in
+                    Button { withAnimation(.snappy) { tab = t } } label: {
+                        VStack(spacing: 2) {
+                            Image(systemName: t.icon).font(.system(size: 16, weight: .semibold))
+                            Text(t.title).font(.system(size: 10, weight: .semibold))
+                        }
+                        .frame(maxWidth: .infinity).padding(.vertical, 7)
+                        .foregroundStyle(tab == t ? Color.white : Color.white.opacity(0.55))
+                        .background { if tab == t { Capsule().fill(Color.white.opacity(0.16)) } }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(4)
+            .glass(26)
+
+            Group {
+                switch tab {
+                case .moments: MomentsPanel(model: model, onSettings: onSettings)
+                case .layout: LayoutPanel(model: model)
+                case .captions: CaptionsPanel(model: model)
+                case .effects: EffectsPanel(model: model)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .padding(14)
+            .frame(height: 190)
+            .glass(26)
+        }
     }
 }

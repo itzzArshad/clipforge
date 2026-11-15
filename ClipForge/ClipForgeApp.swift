@@ -3,6 +3,8 @@ import SwiftUI
 @main
 struct ClipForgeApp: App {
     var body: some Scene {
-        WindowGroup { ContentView() }
+        WindowGroup {
+            ContentView().preferredColorScheme(.dark)
+        }
     }
 }
