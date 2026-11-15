@@ -34,11 +34,15 @@ iPhone with Feather.
 - Transcriber.swift: actor wrapping WhisperKit (word timestamps).
 - Moments.swift: Moment model, TextScorer (excitement lexicon, speech rate, repeats, punctuation),
   ShortShaper (cuts a moment at sentence boundaries: setup before the peak, payoff after).
-- ClaudeRanker.swift: optional Anthropic API (user key in UserDefaults "anthropicKey"): pickShorts (start/end,
-  score, title, hook per moment) and hinglishCaptions (same word count rewrite).
-- Transliterator.swift: Devanagari -> Hinglish (tables + schwa deletion + common-word dictionary).
+- ClaudeRanker.swift: optional Anthropic API (user key in UserDefaults "anthropicKey"): findClips (whole transcript in
+  15-min windows, LOUD marks; returns snapped clips with hook, title, post text, punch words) and fixCaptions.
+- Transliterator.swift: Devanagari and Urdu script -> Roman Hinglish (port of PeakCut roman.py).
 - Facecam.swift: Vision-based facecam detection + manual box editor. Stream layout = facecam top, gameplay bottom.
 - Overlays.swift: watermark and "peak slam" bitmaps.
+- LinkImporter.swift + helper/clipforge_helper.py: Kick/Twitch/YouTube links. The phone cannot run yt-dlp, so a
+  small Python helper on the user's computer downloads (yt-dlp + ffmpeg) and the app pulls the MP4 over Wi-Fi.
+- Ported from PeakCut (MIT, see THIRD_PARTY_NOTICES.md): romanisation, clip/caption prompts, sentence snapping,
+  caption styles (Bounce/Hype/Clean with bundled OFL fonts in ClipForge/Fonts), hook box.
 - Exporter.swift: composition building, video composition, export, save to Photos.
 - GlassKit.swift (Theme, Segments, JobRow), TimelineStrip.swift, Panels.swift, ContentView.swift: UI.
   Design: graphite surfaces, hairlines, one lime accent, mono timecodes. Glass only over video.
@@ -51,4 +55,7 @@ iPhone with Feather.
 - Core Image uses a bottom-left origin. The renderer is designed at 1080x1920; everything scales by k = width / 1080
   (preview renders at 540x960).
 - Never block the main thread with file copies or AVAssetReader loops.
-- Streams are usually Hindi/Hinglish; Whisper with language "hi" outputs Devanagari.
+- Streams are usually Hindi/Hinglish; Whisper with language "hi" outputs Devanagari and sometimes Urdu script.
+  Captions default to Roman Hinglish via Transliterator.roman.
+- Analysis: quick pass (12 loudest stretches) runs after import; "Deep scan" transcribes everything and lets
+  Claude read the whole transcript in 15-minute windows (PeakCut's approach).
