@@ -200,7 +200,7 @@ enum CaptionRenderer {
             .foregroundColor: UIColor.black,
             .paragraphStyle: para
         ])
-        let bound = attr.boundingRect(with: CGSize(width: 820, height: .greatestFiniteMagnitude),
+        let bound = attr.boundingRect(with: CGSize(width: 820, height: CGFloat.greatestFiniteMagnitude),
                                       options: .usesLineFragmentOrigin, context: nil)
         let pill = CGRect(x: (hookSize.width - (bound.width + 80)) / 2,
                           y: (hookSize.height - (bound.height + 50)) / 2,
