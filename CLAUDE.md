@@ -39,8 +39,12 @@ iPhone with Feather.
 - Transliterator.swift: Devanagari and Urdu script -> Roman Hinglish (port of PeakCut roman.py).
 - Facecam.swift: Vision-based facecam detection + manual box editor. Stream layout = facecam top, gameplay bottom.
 - Overlays.swift: watermark and "peak slam" bitmaps.
-- LinkImporter.swift + helper/clipforge_helper.py: Kick/Twitch/YouTube links. The phone cannot run yt-dlp, so a
-  small Python helper on the user's computer downloads (yt-dlp + ffmpeg) and the app pulls the MP4 over Wi-Fi.
+- StreamSources.swift: Twitch (GQL playback token + usher HLS) and Kick (API, with a hidden WKWebView fallback for
+  Cloudflare) VODs and live streams, downloaded ON THE PHONE: pick an H.264 rendition, fetch only the asked-for
+  time range, skip Twitch ad segments, handle "-muted" segments. fMP4 renditions are concatenated as-is.
+- TSRemuxer.swift: MPEG-TS -> MP4 without re-encoding (PAT/PMT/PES demux, H.264 Annex-B -> AVCC, ADTS AAC,
+  AVAssetWriter passthrough with separate video/audio queues so interleaving never deadlocks).
+- LinkImporter.swift: routes links; YouTube only via the optional helper/clipforge_helper.py on a computer (yt-dlp).
 - Ported from PeakCut (MIT, see THIRD_PARTY_NOTICES.md): romanisation, clip/caption prompts, sentence snapping,
   caption styles (Bounce/Hype/Clean with bundled OFL fonts in ClipForge/Fonts), hook box.
 - Exporter.swift: composition building, video composition, export, save to Photos.

@@ -91,7 +91,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showSettings) { SettingsSheet() }
         .sheet(isPresented: $showLink) {
-            LinkSheet(onStart: { link, minutes in model.importLink(link, minutes: minutes) },
+            LinkSheet(onStart: { link, options in model.importLink(link, options: options) },
                       onSettings: { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showSettings = true } })
         }
         .sheet(item: Binding(get: { model.facecamFrame.map { FrameBox(image: $0) } },
@@ -151,7 +151,7 @@ struct WelcomeScreen: View {
                     }
                     Button(action: onLink) {
                         HStack {
-                            Text("Paste a Kick / Twitch / YouTube link").font(.system(size: 16, weight: .semibold))
+                            Text("Paste a Twitch / Kick link").font(.system(size: 16, weight: .semibold))
                             Spacer()
                             Image(systemName: "link").font(.system(size: 15))
                         }

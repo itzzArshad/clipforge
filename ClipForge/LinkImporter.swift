@@ -1,8 +1,31 @@
 import SwiftUI
 
-/// Kick / Twitch / YouTube links. The phone can't run yt-dlp, so the ClipForge helper on the user's computer
-/// downloads the stream and this pulls the finished MP4 over Wi-Fi (see helper/README.md).
+/// Stream links. Twitch and Kick are downloaded on the phone itself (StreamSources). YouTube can't be: it needs
+/// yt-dlp, so it goes through the optional ClipForge helper on a computer (see helper/README.md).
 enum LinkImporter {
+    static func isYouTube(_ link: String) -> Bool {
+        guard let host = URL(string: link.trimmingCharacters(in: .whitespaces))?.host?.lowercased() else { return false }
+        return ["youtube.com", "youtu.be"].contains { host == $0 || host.hasSuffix("." + $0) }
+    }
+
+    /// Picks the route for the link and returns the downloaded file.
+    static func fetch(_ link: String, options: StreamSources.Options,
+                      onStatus: @escaping @MainActor (String, Double?) -> Void) async throws -> Result {
+        if StreamSources.supported(link) {
+            await onStatus("Opening the stream", nil)
+            let src = try await StreamSources.resolve(link)
+            let file = try await StreamSources.download(src, options: options, onStatus: onStatus)
+            return Result(file: file, title: src.title, channel: src.channel)
+        }
+        if isYouTube(link) {
+            guard configured else {
+                throw err("YouTube can't be downloaded inside the app. Twitch and Kick links work directly; for YouTube, run the optional ClipForge helper on a computer, or download the video another way and import it from Files.")
+            }
+            return try await fetchViaHelper(link, liveMinutes: options.liveMinutes, onStatus: onStatus)
+        }
+        throw err("Paste a Twitch or Kick video or channel link (or a YouTube link with the helper set up).")
+    }
+
     struct Result {
         let file: URL
         let title: String
@@ -13,10 +36,7 @@ enum LinkImporter {
     static var key: String { (UserDefaults.standard.string(forKey: "helperKey") ?? "").trimmingCharacters(in: .whitespaces) }
     static var configured: Bool { !address.isEmpty && !key.isEmpty }
 
-    static func supported(_ link: String) -> Bool {
-        guard let host = URL(string: link.trimmingCharacters(in: .whitespaces))?.host?.lowercased() else { return false }
-        return ["youtube.com", "youtu.be", "twitch.tv", "kick.com"].contains { host == $0 || host.hasSuffix("." + $0) }
-    }
+    static func supported(_ link: String) -> Bool { StreamSources.supported(link) || isYouTube(link) }
 
     private static func base() throws -> URL {
         var a = address
@@ -52,7 +72,7 @@ enum LinkImporter {
     }
 
     /// Asks the helper to download `link`, waits for it, then pulls the video. `onStatus` gets (title, progress 0...1).
-    static func fetch(_ link: String, liveMinutes: Int,
+    static func fetchViaHelper(_ link: String, liveMinutes: Int,
                       onStatus: @escaping @MainActor (String, Double?) -> Void) async throws -> Result {
         let start = try await json(try request("jobs", method: "POST",
                                                body: ["url": link.trimmingCharacters(in: .whitespaces), "live_minutes": liveMinutes]))
@@ -149,55 +169,114 @@ final class Downloader: NSObject, URLSessionDownloadDelegate {
 
 /// "Paste a link" sheet.
 struct LinkSheet: View {
-    let onStart: (String, Int) -> Void
+    let onStart: (String, StreamSources.Options) -> Void
     let onSettings: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var link = ""
     @State private var minutes = 30
+    @State private var quality = 720
+    @State private var partOnly = false
+    @State private var from = "0:00"
+    @State private var to = "30:00"
+
+    private var isYT: Bool { LinkImporter.isYouTube(link) }
+    private var canStart: Bool {
+        LinkImporter.supported(link) && (!isYT || LinkImporter.configured) && (!partOnly || (seconds(from) != nil && seconds(to) != nil))
+    }
 
     var body: some View {
         NavigationStack {
-            VStack(alignment: .leading, spacing: 14) {
-                SectionLabel(text: "Kick · Twitch · YouTube")
-                TextField("https://kick.com/… or twitch.tv/videos/…", text: $link, axis: .vertical)
-                    .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-                    .font(.system(size: 15, weight: .medium))
-                    .padding(12)
-                    .background(Theme.raised, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                HStack {
-                    Text("If it's live, record").font(.system(size: 14))
-                    Spacer()
-                    Stepper("\(minutes) min", value: $minutes, in: 5...180, step: 5).fixedSize()
-                }
-                if !LinkImporter.configured {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Set up the helper first").font(.system(size: 14, weight: .bold))
-                        Text("Links are downloaded by the free ClipForge helper on your computer (it uses yt-dlp). Run helper/clipforge_helper.py from the repo, then paste its address and key in Settings.")
-                            .font(.system(size: 12.5)).foregroundStyle(Theme.dim)
-                        Chip(title: "Open settings", icon: "gearshape", selected: true) { dismiss(); onSettings() }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    SectionLabel(text: "Twitch · Kick  (YouTube with the PC helper)")
+                    TextField("twitch.tv/videos/… or kick.com/channel/videos/…", text: $link, axis: .vertical)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                        .font(.system(size: 15, weight: .medium))
+                        .padding(12)
+                        .background(Theme.raised, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                    SectionLabel(text: "Quality")
+                    Segments(items: [480, 720, 1080].map(QualityItem.init), label: { "\($0.h)p" },
+                             value: Binding(get: { QualityItem(h: quality) }, set: { quality = $0.h }))
+                    Text("720p is plenty for Shorts and downloads about half as much as 1080p.")
+                        .font(.system(size: 11.5)).foregroundStyle(Theme.faint)
+
+                    Toggle("Only part of a long VOD", isOn: $partOnly).tint(Theme.accent)
+                        .font(.system(size: 14, weight: .semibold))
+                    if partOnly {
+                        HStack(spacing: 10) {
+                            timeField("From", $from)
+                            timeField("To", $to)
+                        }
+                        Text("Times like 1:05:00. Grabbing the 30-60 minutes you care about is much faster than a whole 4-hour stream.")
+                            .font(.system(size: 11.5)).foregroundStyle(Theme.faint)
                     }
-                    .padding(12).panel(12)
+
+                    HStack {
+                        Text("If it's live, record").font(.system(size: 14))
+                        Spacer()
+                        Stepper("\(minutes) min", value: $minutes, in: 5...120, step: 5).fixedSize()
+                    }
+
+                    if isYT && !LinkImporter.configured {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("YouTube needs the PC helper").font(.system(size: 14, weight: .bold))
+                            Text("YouTube blocks downloads from apps. Twitch and Kick work right here on the phone. For YouTube, run helper/clipforge_helper.py on a computer and add its address in Settings.")
+                                .font(.system(size: 12.5)).foregroundStyle(Theme.dim)
+                            Chip(title: "Open settings", icon: "gearshape", selected: true) { dismiss(); onSettings() }
+                        }
+                        .padding(12).panel(12)
+                    }
+                    Text("Keep ClipForge open while it downloads; iOS pauses apps in the background. Only clip streams you have the rights or the creator's permission to use.")
+                        .font(.system(size: 11.5)).foregroundStyle(Theme.faint)
                 }
-                Text("Only clip streams you have the rights or the creator's permission to use.")
-                    .font(.system(size: 11.5)).foregroundStyle(Theme.faint)
-                Spacer()
+                .padding(16)
             }
-            .padding(16)
             .background(Theme.bg.ignoresSafeArea())
             .navigationTitle("Paste a link")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Get video") { onStart(link, minutes); dismiss() }
-                        .disabled(!LinkImporter.supported(link) || !LinkImporter.configured)
+                    Button("Get video") {
+                        var o = StreamSources.Options()
+                        o.maxHeight = quality
+                        o.liveMinutes = minutes
+                        if partOnly { o.from = seconds(from); o.to = seconds(to) }
+                        onStart(link, o)
+                        dismiss()
+                    }
+                    .disabled(!canStart)
                 }
             }
             .onAppear {
                 if link.isEmpty, let s = UIPasteboard.general.string, LinkImporter.supported(s) { link = s }
             }
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.large])
         .preferredColorScheme(.dark)
     }
+
+    private func timeField(_ title: String, _ text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SectionLabel(text: title)
+            TextField("0:00", text: text)
+                .keyboardType(.numbersAndPunctuation)
+                .font(Theme.mono(15, .semibold))
+                .padding(10)
+                .background(Theme.raised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+    }
+
+    /// "1:05:00" / "65:00" / "3900" -> seconds
+    private func seconds(_ s: String) -> Double? {
+        let parts = s.split(separator: ":").map { Double($0.trimmingCharacters(in: .whitespaces)) }
+        guard !parts.isEmpty, parts.count <= 3, parts.allSatisfy({ $0 != nil }) else { return nil }
+        return parts.compactMap { $0 }.reduce(0) { $0 * 60 + $1 }
+    }
+}
+
+struct QualityItem: Hashable, Identifiable {
+    let h: Int
+    var id: Int { h }
 }

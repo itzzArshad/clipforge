@@ -62,6 +62,20 @@ struct EditablePhrase: Identifiable, Equatable {
     var text: String
 }
 
+/// Asks iOS for a little extra time if the user leaves the app mid-download.
+@MainActor
+final class BackgroundTime {
+    private var id = UIBackgroundTaskIdentifier.invalid
+    init() {
+        id = UIApplication.shared.beginBackgroundTask(withName: "stream-download") { [weak self] in
+            Task { @MainActor in self?.end() }
+        }
+    }
+    func end() {
+        if id != .invalid { UIApplication.shared.endBackgroundTask(id); id = .invalid }
+    }
+}
+
 @MainActor @Observable
 final class EditorModel {
     // source video
@@ -212,12 +226,19 @@ final class EditorModel {
     // MARK: import
 
     /// Kick / Twitch / YouTube link through the helper on the user's computer.
-    func importLink(_ link: String, minutes: Int) {
+    func importLink(_ link: String, options: StreamSources.Options) {
         guard importJob == nil else { return }
-        importJob = Job(title: "Asking your computer", progress: 0)
+        importJob = Job(title: "Opening the stream")
+        // a little extra time if the user switches apps; long downloads still need the app open
+        let bg = BackgroundTime()
+        UIApplication.shared.isIdleTimerDisabled = true      // keep the screen awake while it downloads
         Task {
+            defer {
+                UIApplication.shared.isIdleTimerDisabled = false
+                bg.end()
+            }
             do {
-                let r = try await LinkImporter.fetch(link, liveMinutes: minutes) { [weak self] t, p in
+                let r = try await LinkImporter.fetch(link, options: options) { [weak self] t, p in
                     self?.importJob = Job(title: t, progress: p)
                 }
                 await importVideo(r.file, title: r.title, channel: r.channel)

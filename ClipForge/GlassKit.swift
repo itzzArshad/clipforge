@@ -217,9 +217,9 @@ struct SettingsSheet: View {
                     SecureField("Helper key", text: $helperKey)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
                 } header: {
-                    Text("Stream links (Kick, Twitch, YouTube)")
+                    Text("YouTube links (optional PC helper)")
                 } footer: {
-                    Text("Run helper/clipforge_helper.py on your computer (it uses yt-dlp), then paste the address and key it prints. Phone and computer must be on the same Wi-Fi.")
+                    Text("Twitch and Kick links download on the phone and need nothing here. YouTube blocks app downloads, so it needs helper/clipforge_helper.py running on a computer (it uses yt-dlp). Paste the address and key it prints; phone and computer on the same Wi-Fi.")
                 }
             }
             .navigationTitle("Settings")

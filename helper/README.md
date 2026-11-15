@@ -1,7 +1,7 @@
-# ClipForge helper (Kick, Twitch, YouTube links)
+# ClipForge helper (optional, for YouTube links)
 
-The iPhone app cannot download stream links by itself, so this small program does it on your computer and the app
-pulls the finished video over your Wi-Fi.
+Twitch and Kick links download inside the app; you do not need this for them. YouTube blocks downloads from apps,
+so for YouTube this small program downloads on your computer and the app pulls the finished video over your Wi-Fi.
 
 1. Install Python 3.10+, then: `pip install -U yt-dlp`
 2. Install ffmpeg. Windows: `winget install Gyan.FFmpeg`
