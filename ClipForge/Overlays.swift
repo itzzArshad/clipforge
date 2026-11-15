@@ -76,11 +76,11 @@ enum Overlay {
         let accentColor = CaptionRenderer.palette[min(max(accent, 0), CaptionRenderer.palette.count - 1)]
         let text = Transliterator.isDevanagari(word) ? word : word.uppercased()
         var fs: CGFloat = 170
-        var font = CaptionRenderer.font(for: text, size: fs, style: .pop)
+        var font = CaptionRenderer.font(for: text, size: fs, style: .hype)
         var str = NSAttributedString(string: text, attributes: [.font: font])
         while str.size().width > 960, fs > 70 {
             fs -= 10
-            font = CaptionRenderer.font(for: text, size: fs, style: .pop)
+            font = CaptionRenderer.font(for: text, size: fs, style: .hype)
             str = NSAttributedString(string: text, attributes: [.font: font])
         }
         let sh = NSShadow()

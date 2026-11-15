@@ -1,175 +1,245 @@
 import Foundation
 
-/// Devanagari -> Hinglish (the way people actually type Hindi in Roman letters).
-/// Rule based: consonant/vowel tables, nukta, inherent-"a" deletion, plus a dictionary of
-/// very common words so they come out the way viewers expect ("nahi", "hai", "kya", "yaar").
+/// Hindi (Devanagari) and Urdu script -> Roman letters the way people type Hinglish in chats:
+/// चूना जो उसको -> "chuna jo usko", یار کیا ہے -> "yaar kya hai". Not a translation: the same words.
+///
+/// Ported from PeakCut's roman.py (MIT, https://github.com/haziqahmedqasmi/PeakCut), which is tested against
+/// these spellings. Whisper often writes Hindi speech in Urdu script, so both scripts are handled.
 enum Transliterator {
 
     static func isDevanagari(_ s: String) -> Bool {
-        s.unicodeScalars.contains { (0x0900...0x097F).contains($0.value) }
+        s.unicodeScalars.contains { isDev($0.value) }
     }
 
-    /// Transliterates a whole caption word, keeping leading/trailing punctuation.
-    static func hinglish(_ word: String) -> String {
-        guard isDevanagari(word) else { return word }
-        let scalars = Array(word.unicodeScalars)
-        var lead = "", trail = ""
-        var a = 0, b = scalars.count
-        while a < b, !(0x0900...0x097F).contains(scalars[a].value), !CharacterSet.alphanumerics.contains(scalars[a]) {
-            lead.unicodeScalars.append(scalars[a]); a += 1
-        }
-        while b > a, !(0x0900...0x097F).contains(scalars[b - 1].value), !CharacterSet.alphanumerics.contains(scalars[b - 1]) {
-            trail = String(scalars[b - 1]) + trail; b -= 1
-        }
-        let core = String(String.UnicodeScalarView(scalars[a..<b]))
-        let mapped = dictionary[core] ?? convert(core)
-        let t = trail.replacingOccurrences(of: "।", with: ".").replacingOccurrences(of: "॥", with: ".")
-        return lead + mapped + t
+    /// True if the text is in a script captions should show in Roman letters instead.
+    static func needsRoman(_ s: String) -> Bool {
+        s.unicodeScalars.contains { isDev($0.value) || isUrdu($0.value) }
     }
 
-    // MARK: common words
+    /// Kept for existing callers.
+    static func hinglish(_ word: String) -> String { roman(word) }
 
-    static let dictionary: [String: String] = [
-        "है": "hai", "हैं": "hain", "हे": "he", "नहीं": "nahi", "नही": "nahi", "ना": "na", "न": "na",
-        "क्या": "kya", "क्यों": "kyun", "क्यूँ": "kyun", "क्यूं": "kyun", "कैसे": "kaise", "कहाँ": "kahan", "कहां": "kahan",
-        "कब": "kab", "कौन": "kaun", "मैं": "main", "में": "mein", "मे": "me", "तो": "toh", "हाँ": "haan", "हां": "haan",
-        "यार": "yaar", "भाई": "bhai", "भाइयों": "bhaiyon", "कुछ": "kuch", "बहुत": "bahut", "अच्छा": "accha", "ठीक": "theek",
-        "चलो": "chalo", "चल": "chal", "और": "aur", "यह": "ye", "ये": "ye", "वह": "wo", "वो": "wo", "अभी": "abhi", "भी": "bhi",
-        "हूँ": "hoon", "हूं": "hoon", "था": "tha", "थी": "thi", "थे": "the", "गया": "gaya", "गई": "gayi", "गए": "gaye",
-        "एक": "ek", "के": "ke", "का": "ka", "की": "ki", "को": "ko", "से": "se", "पे": "pe", "पर": "par", "मत": "mat",
-        "हो": "ho", "अरे": "arre", "ओए": "oye", "अबे": "abey", "मार": "maar", "भाग": "bhaag", "बच": "bach", "देख": "dekh",
-        "देखो": "dekho", "लो": "lo", "दो": "do", "जा": "ja", "आ": "aa", "आजा": "aaja", "रुको": "ruko", "रुक": "ruk",
-        "बोल": "bol", "बोलो": "bolo", "सब": "sab", "अपना": "apna", "अपने": "apne", "मेरा": "mera", "मेरी": "meri",
-        "मेरे": "mere", "तेरा": "tera", "तेरी": "teri", "तुम": "tum", "तू": "tu", "आप": "aap", "हम": "hum", "पागल": "pagal",
-        "वाह": "waah", "बस": "bas", "फिर": "phir", "लेकिन": "lekin", "मतलब": "matlab", "सच": "sach", "पता": "pata",
-        "गेम": "game", "किल": "kill", "बंदा": "banda", "बंदे": "bande", "कर": "kar", "करो": "karo", "किया": "kiya",
-        "करना": "karna", "रहा": "raha", "रही": "rahi", "रहे": "rahe", "सकता": "sakta", "जल्दी": "jaldi", "पैसे": "paise",
-        "गाड़ी": "gaadi", "पुलिस": "police", "ओह": "oh", "हाहा": "haha", "हाहाहा": "hahaha"
+    /// Every Hindi and Urdu run in the text spelled in Roman letters. Anything else is left exactly as it is.
+    static func roman(_ text: String) -> String {
+        guard needsRoman(text) else { return text }
+        var out = ""
+        var run = String.UnicodeScalarView()
+        var runKind = 0          // 1 = Devanagari, 2 = Urdu
+        func flush() {
+            guard !run.isEmpty else { return }
+            let s = String(run)
+            out += runKind == 1 ? devWord(s) : urduWord(s)
+            run.removeAll()
+        }
+        for sc in text.unicodeScalars {
+            let v = sc.value
+            let kind = isDev(v) ? 1 : (isUrdu(v) ? 2 : 0)
+            if kind == 0 {
+                flush()
+                switch v {
+                case 0x060C: out += ","          // Urdu comma
+                case 0x061F: out += "?"          // Urdu question mark
+                case 0x06D4: out += "."          // Urdu full stop
+                default: out.unicodeScalars.append(sc)
+                }
+                runKind = 0
+                continue
+            }
+            if kind != runKind { flush(); runKind = kind }
+            run.append(sc)
+        }
+        flush()
+        return out
+    }
+
+    private static func isDev(_ v: UInt32) -> Bool { (0x0900...0x097F).contains(v) }
+    private static func isUrdu(_ v: UInt32) -> Bool {
+        (0x0600...0x06FF).contains(v) || (0x0750...0x077F).contains(v) || (0xFB50...0xFDFF).contains(v) || (0xFE70...0xFEFF).contains(v)
+    }
+
+    // MARK: Hindi
+
+    private static let vowels: [String: String] = [
+        "अ": "a", "आ": "aa", "इ": "i", "ई": "ee", "उ": "u", "ऊ": "oo", "ऋ": "ri", "ए": "e", "ऐ": "ai",
+        "ओ": "o", "औ": "au", "ऑ": "o", "ऍ": "e"
+    ]
+    private static let signs: [String: String] = [
+        "ा": "aa", "ि": "i", "ी": "ee", "ु": "u", "ू": "oo", "ृ": "ri", "े": "e", "ै": "ai", "ो": "o",
+        "ौ": "au", "ॉ": "o", "ॅ": "e"
+    ]
+    private static let cons: [String: String] = [
+        "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "ङ": "n", "च": "ch", "छ": "chh", "ज": "j", "झ": "jh",
+        "ञ": "n", "ट": "t", "ठ": "th", "ड": "d", "ढ": "dh", "ण": "n", "त": "t", "थ": "th", "द": "d", "ध": "dh",
+        "न": "n", "प": "p", "फ": "ph", "ब": "b", "भ": "bh", "म": "m", "य": "y", "र": "r", "ल": "l", "व": "v",
+        "श": "sh", "ष": "sh", "स": "s", "ह": "h", "ळ": "l",
+        "\u{0958}": "q", "\u{0959}": "kh", "\u{095A}": "gh", "\u{095B}": "z", "\u{095E}": "f",
+        "\u{095C}": "r", "\u{095D}": "rh", "\u{095F}": "y"
+    ]
+    private static let nuktaCons: [String: String] = [
+        "क": "q", "ख": "kh", "ग": "gh", "ज": "z", "फ": "f", "ड": "r", "ढ": "rh", "य": "y"
+    ]
+    private static let virama = "्", nuktaSign = "़"
+    private static let nasal: Set<String> = ["ं", "ँ"]
+    private static let other: [String: String] = {
+        var d: [String: String] = ["ः": "h", "।": ".", "॥": ".", "ॐ": "om"]
+        for i in 0..<10 { d[String(UnicodeScalar(0x0966 + UInt32(i))!)] = String(i) }
+        return d
+    }()
+
+    /// Common words whose everyday spelling the rules would not guess (PeakCut's list + gaming words).
+    static let words: [String: String] = [
+        "में": "mein", "मैं": "main", "हैं": "hain", "है": "hai", "नहीं": "nahi", "नही": "nahi", "हूँ": "hoon",
+        "हूं": "hoon", "क्या": "kya", "क्यों": "kyun", "क्यूँ": "kyun", "क्यूं": "kyun", "यह": "ye", "ये": "ye", "वह": "wo",
+        "वो": "wo", "और": "aur", "भी": "bhi", "ही": "hi", "की": "ki", "जी": "ji", "तो": "toh", "हाँ": "haan", "हां": "haan",
+        "यहाँ": "yahan", "यहां": "yahan", "वहाँ": "wahan", "वहां": "wahan", "कहाँ": "kahan", "कहां": "kahan", "थी": "thi",
+        "रही": "rahi", "कभी": "kabhi", "अभी": "abhi", "सभी": "sabhi", "भाई": "bhai", "मुझे": "mujhe",
+        "तुम": "tum", "हम": "hum", "आप": "aap", "बहुत": "bahut", "अच्छा": "accha", "ठीक": "theek", "लिए": "liye",
+        "अरे": "arre", "ओए": "oye", "अबे": "abey", "यार": "yaar", "वाह": "waah", "गेम": "game", "किल": "kill",
+        "पुलिस": "police", "गाड़ी": "gaadi", "गाडी": "gaadi", "कैसे": "kaise", "कौन": "kaun", "गया": "gaya", "गई": "gayi",
+        "गए": "gaye", "हाहा": "haha", "हाहाहा": "hahaha", "ओके": "okay", "ब्रो": "bro"
     ]
 
-    // MARK: tables
-
-    private static let consonants: [UInt32: String] = [
-        0x0915: "k", 0x0916: "kh", 0x0917: "g", 0x0918: "gh", 0x0919: "n",
-        0x091A: "ch", 0x091B: "chh", 0x091C: "j", 0x091D: "jh", 0x091E: "n",
-        0x091F: "t", 0x0920: "th", 0x0921: "d", 0x0922: "dh", 0x0923: "n",
-        0x0924: "t", 0x0925: "th", 0x0926: "d", 0x0927: "dh", 0x0928: "n",
-        0x092A: "p", 0x092B: "ph", 0x092C: "b", 0x092D: "bh", 0x092E: "m",
-        0x092F: "y", 0x0930: "r", 0x0932: "l", 0x0935: "v",
-        0x0936: "sh", 0x0937: "sh", 0x0938: "s", 0x0939: "h",
-        0x0958: "q", 0x0959: "kh", 0x095A: "gh", 0x095B: "z", 0x095C: "d", 0x095D: "dh", 0x095E: "f", 0x095F: "y"
-    ]
-    private static let nukta: [UInt32: String] = [
-        0x0915: "q", 0x0916: "kh", 0x0917: "gh", 0x091C: "z", 0x0921: "d", 0x0922: "dh", 0x092B: "f"
-    ]
-    private static let independent: [UInt32: String] = [
-        0x0905: "a", 0x0906: "aa", 0x0907: "i", 0x0908: "ee", 0x0909: "u", 0x090A: "oo", 0x090B: "ri",
-        0x090F: "e", 0x0910: "ai", 0x0911: "o", 0x0913: "o", 0x0914: "au"
-    ]
-    private static let matras: [UInt32: String] = [
-        0x093E: "aa", 0x093F: "i", 0x0940: "ee", 0x0941: "u", 0x0942: "oo", 0x0943: "ri",
-        0x0947: "e", 0x0948: "ai", 0x0949: "o", 0x094B: "o", 0x094C: "au"
-    ]
-    private static let virama: UInt32 = 0x094D
-    private static let nuktaMark: UInt32 = 0x093C
-    private static let anusvara: UInt32 = 0x0902
-    private static let chandrabindu: UInt32 = 0x0901
-    private static let visarga: UInt32 = 0x0903
-
-    private struct Unit {
-        var cons: String          // consonant cluster ("" for a bare vowel)
-        var vowel: String         // "a" when inherent
+    private struct U {
+        var r: String          // roman consonant or vowel
+        var v: String?         // its vowel; nil = consonant with no vowel
+        var isCons: Bool
         var inherent: Bool
         var nasal = false
-        var dropped = false
     }
 
-    private static func convert(_ word: String) -> String {
-        var units: [Unit] = []
-        var pendingCluster = ""
-        var lastConsCode: UInt32?
-
-        for s in word.unicodeScalars {
-            let v = s.value
-            if let c = consonants[v] {
-                pendingCluster += c
-                lastConsCode = v
-                units.append(Unit(cons: pendingCluster, vowel: "a", inherent: true))
-                pendingCluster = ""
-            } else if v == nuktaMark, let lc = lastConsCode, let n = nukta[lc], !units.isEmpty {
-                let base = consonants[lc] ?? ""
-                var u = units.removeLast()
-                if u.cons.hasSuffix(base) { u.cons = String(u.cons.dropLast(base.count)) + n }
-                units.append(u)
-            } else if v == virama, !units.isEmpty {
-                // consonant joins the next one as a cluster
-                let u = units.removeLast()
-                pendingCluster = u.cons
-            } else if let m = matras[v], !units.isEmpty {
-                units[units.count - 1].vowel = m
-                units[units.count - 1].inherent = false
-            } else if let iv = independent[v] {
-                if !pendingCluster.isEmpty { units.append(Unit(cons: pendingCluster, vowel: "", inherent: false)); pendingCluster = "" }
-                units.append(Unit(cons: "", vowel: iv, inherent: false))
-                lastConsCode = nil
-            } else if v == anusvara || v == chandrabindu, !units.isEmpty {
-                units[units.count - 1].nasal = true
-                if units[units.count - 1].inherent { units[units.count - 1].inherent = false }
-            } else if v == visarga {
-                if !units.isEmpty { units[units.count - 1].vowel += "h" }
-            } else if (0x0966...0x096F).contains(v) {
-                units.append(Unit(cons: String(v - 0x0966), vowel: "", inherent: false))
-            }
-        }
-        if !pendingCluster.isEmpty { units.append(Unit(cons: pendingCluster, vowel: "", inherent: false)) }
-        guard !units.isEmpty else { return word }
-
-        // inherent "a" deletion: drop at word end, and medially (right to left) when the next syllable keeps its vowel
-        let last = units.count - 1
-        if units[last].inherent && units.count > 1 { units[last].dropped = true }
-        if units.count > 2 {
-            var i = last - 1
-            while i >= 1 {
-                let next = units[i + 1]
-                let nextKeeps = !next.dropped && !next.vowel.isEmpty
-                if units[i].inherent && nextKeeps {
-                    units[i].dropped = true
-                    i -= 2   // never drop two in a row
-                    continue
+    private static func devWord(_ w: String) -> String {
+        if let d = words[w] { return d }
+        let ch = w.unicodeScalars.map { String($0) }
+        var units: [U] = []
+        var i = 0
+        while i < ch.count {
+            let c = ch[i]
+            var nxt = i + 1 < ch.count ? ch[i + 1] : ""
+            if var r = cons[c] {
+                if nxt == nuktaSign {
+                    r = nuktaCons[c] ?? r
+                    i += 1
+                    nxt = i + 1 < ch.count ? ch[i + 1] : ""
                 }
-                i -= 1
+                if nxt == virama { units.append(U(r: r, v: nil, isCons: true, inherent: false)); i += 2; continue }
+                if let s = signs[nxt] { units.append(U(r: r, v: s, isCons: true, inherent: false)); i += 2; continue }
+                units.append(U(r: r, v: "a", isCons: true, inherent: true))
+            } else if let v = vowels[c] {
+                units.append(U(r: "", v: v, isCons: false, inherent: false))
+            } else if nasal.contains(c) {
+                if !units.isEmpty {
+                    units[units.count - 1].v = (units[units.count - 1].v ?? "") + "n"
+                    units[units.count - 1].inherent = false
+                    units[units.count - 1].nasal = true
+                } else {
+                    units.append(U(r: "n", v: nil, isCons: true, inherent: false))
+                }
+            } else if let o = other[c] {
+                units.append(U(r: o, v: nil, isCons: false, inherent: false))
+            } else if c == nuktaSign || c == virama {
+                // stray mark
+            } else {
+                units.append(U(r: c, v: nil, isCons: false, inherent: false))
             }
+            i += 1
         }
-
-        var out = ""
-        for (i, u) in units.enumerated() {
-            var cons = u.cons
-            var vowel = u.dropped ? "" : u.vowel
-            let isLast = i == last
-            // v -> w before back vowels ("wo", "wala", "waah")
-            if cons == "v", ["aa", "o", "au", "e"].contains(vowel) || (vowel == "a" && i == 0) { cons = "w" }
-            if isLast {
-                if vowel == "aa" { vowel = "a" }
-                if vowel == "ee" { vowel = "i" }
-                if vowel == "oo" { vowel = u.nasal ? "oon" : "u" }
-            } else if vowel == "aa", let n = units[safe: i + 1], n.cons.isEmpty, !n.vowel.isEmpty {
-                vowel = "a"   // "bhaai" -> "bhai"
-            }
-            // a bare "e" after another vowel is written with a y: "gae" -> "gaye"
-            if cons.isEmpty, i > 0, !(units[i - 1].dropped), !units[i - 1].vowel.isEmpty, vowel == "e" {
-                cons = "y"
-            }
-            out += cons + vowel
-            if u.nasal {
-                let finalEe = isLast && u.vowel == "ee"
-                let alreadyN = vowel.hasSuffix("n")
-                if !finalEe && !alreadyN {
-                    let nextCons = units[safe: i + 1]?.cons ?? ""
-                    out += (nextCons.hasPrefix("p") || nextCons.hasPrefix("b") || nextCons.hasPrefix("m")) ? "m" : "n"
+        // letters = units that are consonants or carry a vowel
+        let letters = units.indices.filter { units[$0].isCons || !(units[$0].v ?? "").isEmpty }
+        func vowelSet(_ k: Int) -> Bool { !(units[k].v ?? "").isEmpty }
+        // Hindi drops the carried "a" at the end of a word, and between a vowel and another vowel-carrying letter
+        // (कहना -> kahna, not kahana). Looked at right to left, as speakers do.
+        if letters.count > 1, let last = letters.last, units[last].inherent { units[last].v = nil }
+        if letters.count > 2 {
+            for k in stride(from: letters.count - 2, through: 1, by: -1) {
+                let u = letters[k], before = letters[k - 1], after = letters[k + 1]
+                if units[u].inherent && vowelSet(before) && units[after].isCons && vowelSet(after) && !units[before].nasal {
+                    units[u].v = nil
                 }
             }
         }
-        return out
+        // Long vowels the way people type them: doubled only before a consonant that ends a syllable
+        // (baat, kaam, aaj), single elsewhere (hamara, pata, ki, tu).
+        let short = ["aa": "a", "ee": "i", "oo": "u"]
+        for (k, u) in letters.enumerated() {
+            if let v = units[u].v, let s = short[v] {
+                let after = k + 1 < letters.count ? letters[k + 1] : nil
+                if after == nil || vowelSet(after!) { units[u].v = s }
+            }
+        }
+        return units.map { $0.r + ($0.v ?? "") }.joined()
+    }
+
+    // MARK: Urdu
+
+    private static let urWords: [String: String] = [
+        "ہے": "hai", "ہیں": "hain", "ہوں": "hoon", "ہو": "ho", "ہی": "hi", "یہ": "ye", "وہ": "wo", "کیا": "kya",
+        "کیوں": "kyun", "نہیں": "nahi", "نہ": "na", "میں": "main", "میرا": "mera", "میری": "meri", "میرے": "mere",
+        "تو": "to", "کہ": "ke", "کی": "ki", "کا": "ka", "کے": "ke", "کو": "ko", "سے": "se", "پر": "par",
+        "اور": "aur", "بھی": "bhi", "تھا": "tha", "تھی": "thi", "تھے": "the", "گیا": "gaya", "گئی": "gayi",
+        "رہا": "raha", "رہی": "rahi", "رہے": "rahe", "بہت": "bahut", "اچھا": "achha", "یار": "yaar", "بھائی": "bhai",
+        "آپ": "aap", "ہم": "hum", "تم": "tum", "مجھے": "mujhe", "تمہیں": "tumhein", "اب": "ab", "کر": "kar",
+        "کرو": "karo", "کرنا": "karna", "دیکھو": "dekho", "چلو": "chalo", "ابھی": "abhi", "کبھی": "kabhi",
+        "جی": "ji", "ہاں": "haan", "نا": "na", "اللہ": "Allah", "ٹھیک": "theek", "پتا": "pata", "پتہ": "pata",
+        "لیکن": "lekin", "پھر": "phir", "سب": "sab", "کچھ": "kuch", "کون": "kaun", "کہاں": "kahan", "یہاں": "yahan",
+        "وہاں": "wahan", "ایک": "ek", "دو": "do", "اپنا": "apna", "اپنی": "apni", "لوگ": "log", "بات": "baat",
+        "کام": "kaam", "دن": "din", "آج": "aaj", "کل": "kal", "بس": "bas", "شکریہ": "shukriya", "واہ": "wah",
+        "گھر": "ghar", "ہوا": "hua", "ہوئی": "hui", "ہوئے": "hue", "اس": "us", "ان": "un", "جو": "jo", "جب": "jab",
+        "تب": "tab", "مگر": "magar", "زندگی": "zindagi", "پیسے": "paise", "روپے": "rupay", "ارے": "arre",
+        "مار": "maar", "بھاگ": "bhaag", "گاڑی": "gaadi", "پولیس": "police"
+    ]
+    private static let urCons: [Character: String] = [
+        "ب": "b", "پ": "p", "ت": "t", "ٹ": "t", "ث": "s", "ج": "j", "چ": "ch", "ح": "h", "خ": "kh", "د": "d",
+        "ڈ": "d", "ذ": "z", "ر": "r", "ڑ": "r", "ز": "z", "ژ": "zh", "س": "s", "ش": "sh", "ص": "s", "ض": "z",
+        "ط": "t", "ظ": "z", "غ": "gh", "ف": "f", "ق": "q", "ک": "k", "ك": "k", "گ": "g", "ل": "l", "م": "m",
+        "ن": "n", "ہ": "h", "ه": "h", "ة": "a", "ھ": "h"
+    ]
+    private static let urMarks: [UInt32: String] = [
+        0x064E: "a", 0x0650: "i", 0x064F: "u", 0x0651: "", 0x0652: "", 0x064B: "an", 0x0670: "a"
+    ]
+
+    private static func urduWord(_ w: String) -> String {
+        if let d = urWords[w] { return d }
+        let sc = Array(w.unicodeScalars)
+        var out: [String] = []
+        var prevCons = false
+        for i in 0..<sc.count {
+            let v = sc[i].value
+            let ch = Character(sc[i])
+            let first = i == 0, last = i == sc.count - 1
+            if let m = urMarks[v] { out.append(m); prevCons = false; continue }
+            if (0x06F0...0x06F9).contains(v) { out.append(String(v - 0x06F0)); prevCons = false; continue }
+            if (0x0660...0x0669).contains(v) { out.append(String(v - 0x0660)); prevCons = false; continue }
+            if ch == "ھ" { out.append("h"); continue }                          // the "h" of bh, ph, kh, chh
+            if ch == "ا" || ch == "آ" { out.append(ch == "آ" ? "aa" : "a"); prevCons = false; continue }
+            if ch == "و" || ch == "ؤ" {
+                if first || !prevCons { out.append("w"); prevCons = true } else { out.append("o"); prevCons = false }
+                continue
+            }
+            if "یيئى".contains(ch) {
+                if first {
+                    out.append("y"); prevCons = true
+                } else {
+                    let nxt: Character? = i + 1 < sc.count ? Character(sc[i + 1]) : nil
+                    let s = last ? "i" : (prevCons && !(nxt.map { "اآوؤ".contains($0) } ?? false) ? "ee" : "y")
+                    out.append(s); prevCons = s == "y"
+                }
+                continue
+            }
+            if ch == "ے" { out.append("e"); prevCons = false; continue }
+            if ch == "ں" { out.append("n"); continue }
+            if ch == "ع" || ch == "ء" { continue }
+            guard let c = urCons[ch] else { out.append(String(ch)); prevCons = false; continue }
+            if (ch == "ہ" || ch == "ه") && last && prevCons { out.append("a"); prevCons = false; continue }
+            if (prevCons && i == 1) || (prevCons && i == 2 && Character(sc[1]) == "ھ") { out.append("a") }
+            out.append(c)
+            prevCons = true
+        }
+        var s = out.joined()
+        // no vowel at all: give it the one Urdu leaves out
+        if s.count >= 2, s.allSatisfy({ $0.isASCII && $0.isLowercase }), !s.contains(where: { "aeiou".contains($0) }) {
+            s = String(s.dropLast()) + "a" + String(s.last!)
+        }
+        return s
     }
 }
 

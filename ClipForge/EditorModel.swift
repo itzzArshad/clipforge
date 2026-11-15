@@ -62,10 +62,26 @@ struct EditablePhrase: Identifiable, Equatable {
     var text: String
 }
 
+/// Asks iOS for a little extra time if the user leaves the app mid-download.
+@MainActor
+final class BackgroundTime {
+    private var id = UIBackgroundTaskIdentifier.invalid
+    init() {
+        id = UIApplication.shared.beginBackgroundTask(withName: "stream-download") { [weak self] in
+            Task { @MainActor in self?.end() }
+        }
+    }
+    func end() {
+        if id != .invalid { UIApplication.shared.endBackgroundTask(id); id = .invalid }
+    }
+}
+
 @MainActor @Observable
 final class EditorModel {
     // source video
     var videoURL: URL?
+    var videoTitle = ""          // from a stream link: helps Claude with names and context
+    var channel = ""
     var duration = 0.0
     var wave: [Float] = []
     var hasVideo: Bool { videoURL != nil }
@@ -209,8 +225,36 @@ final class EditorModel {
 
     // MARK: import
 
-    func importVideo(_ url: URL) async {
+    /// Kick / Twitch / YouTube link through the helper on the user's computer.
+    func importLink(_ link: String, options: StreamSources.Options) {
+        guard importJob == nil else { return }
+        importJob = Job(title: "Opening the stream")
+        // a little extra time if the user switches apps; long downloads still need the app open
+        let bg = BackgroundTime()
+        UIApplication.shared.isIdleTimerDisabled = true      // keep the screen awake while it downloads
+        Task {
+            defer {
+                UIApplication.shared.isIdleTimerDisabled = false
+                bg.end()
+            }
+            do {
+                let r = try await LinkImporter.fetch(link, options: options) { [weak self] t, p in
+                    self?.importJob = Job(title: t, progress: p)
+                }
+                await importVideo(r.file, title: r.title, channel: r.channel)
+            } catch {
+                importJob = nil
+                show(error.localizedDescription)
+            }
+        }
+    }
+
+    func importVideo(_ url: URL, title: String = "", channel: String = "") async {
         analysisTask?.cancel()
+        analysisTask = nil
+        analysisJob = nil
+        videoTitle = title
+        self.channel = channel
         importJob = Job(title: "Reading audio")
         defer { importJob = nil }
         do {
@@ -327,7 +371,7 @@ final class EditorModel {
     }
 
     /// Builds the composition for [s, e] and a fresh render state (levels, caption pages, slam cue).
-    func prepare(_ s: Double, _ e: Double, hook: String) async throws -> (BuiltClip, ReelState) {
+    func prepare(_ s: Double, _ e: Double, hook: String, highlights: [String] = []) async throws -> (BuiltClip, ReelState) {
         guard let url = videoURL else { throw ExportError.noVideo }
         let keep = removeSilence ? AudioAnalyzer.keepRanges(bins: bins, start: s, end: e) : [s...e]
         let b = try await Exporter.build(url: url, keep: keep)
@@ -343,8 +387,8 @@ final class EditorModel {
         st.logo = logo
 
         let mapped = mapWords(sourceWords.filter { $0.end > s && $0.start < e }, keep: keep)
-        let cw = CaptionBuilder.words(from: mapped, norm: levels.norm)
-        st.pages = CaptionBuilder.pages(from: cw)
+        let cw = CaptionBuilder.words(from: mapped, norm: levels.norm, highlights: highlights)
+        st.pages = CaptionBuilder.pages(from: cw, per: style.captionStyle.spec.perPage)
         st.slam = slamCue(words: cw, env: levels.env)
         return (b, st)
     }
@@ -363,7 +407,7 @@ final class EditorModel {
     func rebuildPreview() async {
         guard videoURL != nil else { return }
         do {
-            let (b, st) = try await prepare(start, end, hook: style.hook)
+            let (b, st) = try await prepare(start, end, hook: style.hook, highlights: selectedMoment?.highlights ?? [])
             if Task.isCancelled { return }
             state = st
             clipDuration = b.comp.duration.seconds
@@ -457,27 +501,35 @@ final class EditorModel {
         scheduleRebuild()
     }
 
-    /// Claude rewrites the clip's caption words as clean Hinglish (same word count, same timing).
+    /// Claude tidies the clip's caption words: Hinglish spelling, digits, names, punctuation. Same word count and
+    /// timing; anything that looks like a translation instead of a spelling is refused (PeakCut's rules).
     func aiFixCaptions() {
         let key = UserDefaults.standard.string(forKey: "anthropicKey") ?? ""
         guard !key.isEmpty else { show("Add your Claude API key in Settings"); return }
         guard captionJob == nil else { return }
         let idx = sourceWords.indices.filter { sourceWords[$0].end > start && sourceWords[$0].start < end }
-        guard !idx.isEmpty else { show("Generate captions first"); return }
-        captionJob = Job(title: "Polishing Hinglish with Claude")
+        guard !idx.isEmpty else { show("Transcribe the clip first"); return }
+        captionJob = Job(title: "Claude is fixing the captions")
+        let title = videoTitle
         Task {
             defer { captionJob = nil }
             do {
                 let originals = idx.map { sourceWords[$0].text }
-                guard let fixed = try await ClaudeRanker.hinglishCaptions(originals, apiKey: key) else {
-                    show("Claude changed the word count, kept the original"); return
-                }
-                for (n, i) in idx.enumerated() where i < sourceWords.count {
+                let fixed = try await ClaudeRanker.fixCaptions(originals, apiKey: key, title: title)
+                guard fixed.count == idx.count else { return }
+                // apply back to front so removals do not shift the indices still to come
+                for (n, i) in idx.enumerated().reversed() where i < sourceWords.count {
                     let t = fixed[n].trimmingCharacters(in: .whitespaces)
-                    if !t.isEmpty { sourceWords[i].text = t; sourceWords[i].fixed = true }
+                    if t.isEmpty {
+                        if n > 0 { sourceWords[idx[n - 1]].end = sourceWords[i].end }
+                        sourceWords.remove(at: i)
+                    } else {
+                        sourceWords[i].text = t
+                        sourceWords[i].fixed = true
+                    }
                 }
                 scheduleRebuild()
-                show("Captions polished")
+                show("Captions fixed")
             } catch {
                 show("Claude failed: \(error.localizedDescription)")
             }
@@ -551,10 +603,23 @@ final class EditorModel {
 
     // MARK: moment finding (background)
 
+    /// Quick pass: transcribe the 12 loudest stretches, cut each at sentence boundaries, then let Claude
+    /// (if there is a key) pick and cut clips from everything transcribed so far.
     func analyzeSpeech() {
         guard videoURL != nil, analysisTask == nil else { return }
         analysisTask = Task { [weak self] in
             await self?.runAnalysis()
+            self?.analysisTask = nil
+            self?.analysisJob = nil
+        }
+    }
+
+    /// Deep scan (how PeakCut works): transcribe the whole video, then Claude reads all of it in 15-minute
+    /// windows. Finds story moments that are not loud. Slow on a long stream, so it is a separate button.
+    func deepScan() {
+        guard videoURL != nil, analysisTask == nil else { return }
+        analysisTask = Task { [weak self] in
+            await self?.runDeepScan()
             self?.analysisTask = nil
             self?.analysisJob = nil
         }
@@ -581,19 +646,7 @@ final class EditorModel {
                 let raw = isCovered(win) ? sourceWords.filter { $0.start >= win.lowerBound && $0.end <= win.upperBound }
                                          : try await transcribe(win)
                 guard let i2 = moments.firstIndex(where: { $0.id == id }) else { continue }
-                var u = moments[i2]
-                let (s, e) = ShortShaper.shape(peak: m.peak, words: raw, window: win, duration: duration)
-                let inClip = raw.filter { $0.start >= s && $0.end <= e }
-                u.start = s; u.end = e
-                u.text = TextScorer.score(words: inClip, duration: e - s)
-                u.transcript = inClip.map { Transliterator.hinglish($0.text) }.joined(separator: " ")
-                let peakLine = ShortShaper.lines(raw).first { $0.start <= m.peak + 1 && $0.end >= m.peak - 1 }
-                if u.title.isEmpty, let pl = peakLine {
-                    u.title = "“" + pl.text.split(separator: " ").prefix(5).joined(separator: " ") + "”"
-                }
-                u.stage = .shaped
-                moments[i2] = u
-                if selectedID == id { setTrim(u.start, u.end, resetDetail: true) }
+                shapeLoud(i2, words: raw, window: win)
             } catch {
                 if let i2 = moments.firstIndex(where: { $0.id == id }) { moments[i2].stage = .loud }
                 show("Transcription failed: \(error.localizedDescription)")
@@ -602,59 +655,167 @@ final class EditorModel {
         }
         if source == .loud { source = .best }
         if hasAPIKey && !Task.isCancelled {
-            analysisJob = Job(title: "Claude is cutting the shorts", detail: "context, hooks, scores",
-                              progress: Double(targets.count) / total)
-            await aiPick()
+            await aiFind(progressBase: Double(targets.count) / total, progressSpan: 1 / total)
         }
     }
 
-    /// Claude reads each moment's transcript and decides where the short should start and end.
-    func aiPick() async {
+    private func runDeepScan() async {
+        let chunk = 90.0
+        var t = 0.0
+        var spans: [ClosedRange<Double>] = []
+        while t < duration { spans.append(t...min(duration, t + chunk)); t += chunk }
+        let todo = spans.filter { !isCovered($0) }
+        let aiShare = hasAPIKey ? 0.1 : 0
+        for (n, r) in todo.enumerated() {
+            if Task.isCancelled { return }
+            analysisJob = Job(title: "Deep scan: transcribing the whole video",
+                              detail: "\(clock(r.lowerBound)) of \(clock(duration))",
+                              progress: (1 - aiShare) * Double(n) / Double(max(todo.count, 1)))
+            do { _ = try await transcribe(r) } catch {
+                show("Transcription failed: \(error.localizedDescription)")
+                return
+            }
+        }
+        // re-shape the loud moments now that the whole transcript is known
+        for i in moments.indices where moments[i].stage != .ai {
+            let m = moments[i]
+            let win = max(0, m.peak - 38)...min(duration, m.peak + 26)
+            shapeLoud(i, words: sourceWords.filter { $0.start >= win.lowerBound && $0.end <= win.upperBound }, window: win)
+        }
+        if hasAPIKey && !Task.isCancelled {
+            await aiFind(progressBase: 1 - aiShare, progressSpan: aiShare)
+        } else {
+            addSpeechMoments()
+            source = .best
+            show("Deep scan done · add a Claude key for smarter picks")
+        }
+    }
+
+    /// Cuts a loud moment at sentence boundaries and scores what was said.
+    private func shapeLoud(_ i: Int, words raw: [RawWord], window win: ClosedRange<Double>) {
+        var u = moments[i]
+        let (s, e) = ShortShaper.shape(peak: u.peak, words: raw, window: win, duration: duration)
+        let inClip = raw.filter { $0.start >= s && $0.end <= e }
+        u.start = s; u.end = e
+        u.text = TextScorer.score(words: inClip, duration: e - s)
+        u.transcript = inClip.map { Transliterator.roman($0.text) }.joined(separator: " ")
+        let peakLine = ShortShaper.lines(raw).first { $0.start <= u.peak + 1 && $0.end >= u.peak - 1 }
+        if u.title.isEmpty, let pl = peakLine {
+            u.title = "“" + pl.text.split(separator: " ").prefix(5).joined(separator: " ") + "”"
+        }
+        u.stage = .shaped
+        moments[i] = u
+        if selectedID == u.id { setTrim(u.start, u.end, resetDetail: true) }
+    }
+
+    /// Without Claude: the most excited-sounding stretches of speech that are not already a moment.
+    private func addSpeechMoments() {
+        let words = sourceWords
+        guard words.count > 20 else { return }
+        var cands: [(Double, Double, Float)] = []
+        var t = 0.0
+        while t + 40 <= duration {
+            let w = words.filter { $0.start >= t && $0.end <= t + 40 }
+            cands.append((t, t + 40, TextScorer.score(words: w, duration: 40)))
+            t += 10
+        }
+        var added = 0
+        for c in cands.sorted(by: { $0.2 > $1.2 }) where added < 6 && c.2 > 0.35 {
+            if moments.contains(where: { min(c.1, $0.end) - max(c.0, $0.start) > 10 }) { continue }
+            guard let r = ShortShaper.snap(start: c.0, end: c.1, words: words, duration: duration) else { continue }
+            let inClip = words.filter { $0.start >= r.0 && $0.end <= r.1 }
+            var m = Moment(start: r.0, end: r.1, peak: peakTime(in: r.0...r.1), loud: loudScore(r.0...r.1))
+            m.text = c.2
+            m.transcript = inClip.map { Transliterator.roman($0.text) }.joined(separator: " ")
+            m.title = "“" + inClip.prefix(5).map { Transliterator.roman($0.text) }.joined(separator: " ") + "”"
+            m.stage = .shaped
+            moments.append(m)
+            added += 1
+        }
+    }
+
+    /// 0...1: how loud this stretch is compared with the whole video.
+    private func loudScore(_ r: ClosedRange<Double>) -> Float {
+        guard !bins.isEmpty else { return 0 }
+        let a = max(0, Int(r.lowerBound / AudioAnalyzer.binSeconds))
+        let b = min(bins.count - 1, Int(r.upperBound / AudioAnalyzer.binSeconds))
+        guard a <= b else { return 0 }
+        let lv = AudioAnalyzer.levels(bins: bins).norm
+        return lv[a...b].reduce(0, +) / Float(b - a + 1)
+    }
+
+    /// Per-second loudness z-scores (PeakCut's loud_zscore), used to mark (LOUD) lines for Claude.
+    private func loudZ() -> [Float] {
+        let perSec = Int(1 / AudioAnalyzer.binSeconds)
+        var secs: [Float] = []
+        var i = 0
+        while i < bins.count { secs.append(bins[i..<min(bins.count, i + perSec)].max() ?? -60); i += perSec }
+        guard secs.count >= 5 else { return [Float](repeating: 0, count: secs.count) }
+        let median = secs.sorted()[secs.count / 2]
+        let mean = secs.reduce(0, +) / Float(secs.count)
+        let sd = sqrt(secs.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Float(secs.count))
+        return secs.map { ($0 - median) / (sd + 1e-6) }
+    }
+
+    /// Claude reads everything transcribed so far and returns clips with start/end, hook, title, post text and
+    /// punch words. They replace the moments they overlap.
+    func aiFind(progressBase: Double = 0, progressSpan: Double = 1) async {
         let key = UserDefaults.standard.string(forKey: "anthropicKey") ?? ""
         guard !key.isEmpty else { show("Add your Claude API key in Settings"); return }
-        var cands: [ClaudeRanker.Candidate] = []
-        var windows: [Int: (UUID, ClosedRange<Double>)] = [:]
-        for (i, m) in moments.enumerated() where m.stage == .shaped || m.stage == .ai {
-            let win = max(0, m.peak - 38)...min(duration, m.peak + 26)
-            let words = sourceWords.filter { $0.start >= win.lowerBound && $0.end <= win.upperBound }
-            let lines = ShortShaper.lines(words)
-            guard !lines.isEmpty else { continue }
-            cands.append(.init(id: i, peak: m.peak, lines: lines))
-            windows[i] = (m.id, win)
+        let words = sourceWords.sorted { $0.start < $1.start }
+        let z = loudZ()
+        let lines = ShortShaper.lines(words, gap: 0.7).map { l -> ClaudeRanker.Line in
+            let a = max(0, Int(l.start)), b = min(z.count - 1, Int(l.end))
+            let loud = a <= b && (z[a...b].max() ?? 0) > 1.5
+            return ClaudeRanker.Line(start: l.start, end: l.end, text: l.text, loud: loud)
         }
-        guard !cands.isEmpty else { show("No speech found to analyse"); return }
+        guard lines.count >= 3 else { show("Not enough speech to analyse yet"); return }
+        analysisJob = Job(title: "Claude is picking the shorts", detail: "context, hooks, titles", progress: progressBase)
         do {
-            let picks = try await ClaudeRanker.pickShorts(cands, apiKey: key, language: languageName)
-            for p in picks {
-                guard let w = windows[p.id], let i = moments.firstIndex(where: { $0.id == w.0 }) else { continue }
-                let win = w.1
-                let s = min(max(p.start, win.lowerBound), win.upperBound - 8)
-                let e = max(min(p.end, win.upperBound), s + 8)
-                moments[i].start = s
-                moments[i].end = e
-                moments[i].ai = p.score
-                if !p.title.isEmpty { moments[i].title = p.title }
-                moments[i].hook = p.hook
-                moments[i].reason = p.reason
-                moments[i].stage = .ai
-                let clipWords = sourceWords.filter { $0.start >= s && $0.end <= e }
-                moments[i].transcript = clipWords.map { Transliterator.hinglish($0.text) }.joined(separator: " ")
+            let clips = try await ClaudeRanker.findClips(
+                lines: lines, words: words, duration: duration, title: videoTitle, channel: channel,
+                maxClips: 12, minLen: 15, maxLen: 60, apiKey: key,
+                progress: { [weak self] p in self?.analysisJob?.progress = progressBase + progressSpan * p })
+            guard !clips.isEmpty else { show("Claude found nothing worth clipping here"); return }
+            var keep = moments.filter { m in !clips.contains { min(m.end, $0.end) - max(m.start, $0.start) > 0.3 * m.duration } }
+            for c in clips {
+                var m = Moment(start: c.start, end: c.end, peak: peakTime(in: c.start...c.end), loud: loudScore(c.start...c.end))
+                let inClip = words.filter { $0.start >= c.start && $0.end <= c.end }
+                m.text = TextScorer.score(words: inClip, duration: c.end - c.start)
+                m.ai = c.score
+                m.title = c.title
+                m.hook = c.hook
+                m.reason = c.reason
+                m.category = c.category
+                m.postTitle = c.title
+                m.postText = c.description + (c.hashtags.isEmpty ? "" : "\n\n" + c.hashtags.map { "#" + $0 }.joined(separator: " "))
+                m.highlights = c.highlights
+                m.transcript = inClip.map { Transliterator.roman($0.text) }.joined(separator: " ")
+                m.stage = .ai
+                keep.append(m)
             }
+            moments = keep
             source = .best
             if let top = visibleMoments.first { select(top) }
-            show("Claude picked \(picks.count) shorts")
+            show("Claude picked \(clips.count) shorts")
         } catch {
             show("Claude failed: \(error.localizedDescription)")
         }
+    }
+
+    func copyPostText(_ m: Moment) {
+        let text = [m.postTitle, m.postText].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        UIPasteboard.general.string = text.isEmpty ? m.title : text
+        show("Post text copied")
     }
 
     // MARK: export (background, one or many)
 
     func exportCurrent() {
         guard exportJob == nil else { return }
-        let s = start, e = end, hook = style.hook
+        let s = start, e = end, hook = style.hook, hl = selectedMoment?.highlights ?? []
         exportTask = Task {
-            await exportOne(s, e, hook: hook, label: "Exporting reel", index: 0, count: 1)
+            await exportOne(s, e, hook: hook, highlights: hl, label: "Exporting reel", index: 0, count: 1)
             exportJob = nil
             exportTask = nil
         }
@@ -669,7 +830,7 @@ final class EditorModel {
             var ok = 0
             for (n, m) in list.enumerated() {
                 if Task.isCancelled { break }
-                if await exportOne(m.start, m.end, hook: m.hook, label: "Exporting shorts", index: n, count: list.count) {
+                if await exportOne(m.start, m.end, hook: m.hook, highlights: m.highlights, label: "Exporting shorts", index: n, count: list.count) {
                     ok += 1
                     if let i = moments.firstIndex(where: { $0.id == m.id }) { moments[i].exported = true }
                 }
@@ -688,7 +849,7 @@ final class EditorModel {
     }
 
     @discardableResult
-    private func exportOne(_ s: Double, _ e: Double, hook: String, label: String, index: Int, count: Int) async -> Bool {
+    private func exportOne(_ s: Double, _ e: Double, hook: String, highlights: [String] = [], label: String, index: Int, count: Int) async -> Bool {
         let detail = count > 1 ? "\(index + 1) of \(count)" : ""
         exportJob = Job(title: label, detail: detail, progress: Double(index) / Double(count))
         do {
@@ -697,7 +858,7 @@ final class EditorModel {
                 _ = try await transcribe(s...e)
             }
             exportJob?.title = label
-            let (b, st) = try await prepare(s, e, hook: hook)
+            let (b, st) = try await prepare(s, e, hook: hook, highlights: highlights)
             let out = try await Exporter.export(b, state: st) { [weak self] p in
                 self?.exportJob?.progress = (Double(index) + p) / Double(count)
             }

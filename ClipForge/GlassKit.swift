@@ -195,6 +195,8 @@ struct PlayerView: UIViewRepresentable {
 
 struct SettingsSheet: View {
     @AppStorage("anthropicKey") private var key = ""
+    @AppStorage("helperURL") private var helperURL = ""
+    @AppStorage("helperKey") private var helperKey = ""
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -207,13 +209,23 @@ struct SettingsSheet: View {
                 } header: {
                     Text("Claude API key (optional)")
                 } footer: {
-                    Text("Turns on: Claude cutting each short with proper context, hook titles, and Hinglish caption polish. Only transcript text is sent to api.anthropic.com, never video or audio. Typical cost is well under one US cent per stream with Claude Haiku. The key stays on this phone.")
+                    Text("Turns on: Claude picking and cutting the shorts with proper context, hooks, post titles and hashtags, and caption fixes. Only transcript text is sent to api.anthropic.com, never video or audio. Typical cost is well under one US cent per stream with Claude Haiku. The key stays on this phone.")
+                }
+                Section {
+                    TextField("http://192.168.1.5:8790", text: $helperURL)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                    SecureField("Helper key", text: $helperKey)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                } header: {
+                    Text("YouTube links (optional PC helper)")
+                } footer: {
+                    Text("Twitch and Kick links download on the phone and need nothing here. YouTube blocks app downloads, so it needs helper/clipforge_helper.py running on a computer (it uses yt-dlp). Paste the address and key it prints; phone and computer on the same Wi-Fi.")
                 }
             }
             .navigationTitle("Settings")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
-        .presentationDetents([.medium])
+        .presentationDetents([.large])
         .preferredColorScheme(.dark)
     }
 }

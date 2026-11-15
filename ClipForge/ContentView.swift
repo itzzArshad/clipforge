@@ -23,6 +23,7 @@ struct ContentView: View {
     @State private var showPhotos = false
     @State private var showFiles = false
     @State private var showSettings = false
+    @State private var showLink = false
     @State private var tab: EditorTab = .moments
 
     var body: some View {
@@ -33,9 +34,11 @@ struct ContentView: View {
                 EditorScreen(model: model, tab: $tab,
                              onPhotos: { showPhotos = true },
                              onFiles: { showFiles = true },
+                             onLink: { showLink = true },
                              onSettings: { showSettings = true })
             } else {
-                WelcomeScreen(busy: model.importJob, onPhotos: { showPhotos = true }, onFiles: { showFiles = true })
+                WelcomeScreen(busy: model.importJob, onPhotos: { showPhotos = true }, onFiles: { showFiles = true },
+                              onLink: { showLink = true })
             }
 
             VStack {
@@ -87,6 +90,10 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showSettings) { SettingsSheet() }
+        .sheet(isPresented: $showLink) {
+            LinkSheet(onStart: { link, options in model.importLink(link, options: options) },
+                      onSettings: { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showSettings = true } })
+        }
         .sheet(item: Binding(get: { model.facecamFrame.map { FrameBox(image: $0) } },
                              set: { if $0 == nil { model.facecamFrame = nil } })) { box in
             FacecamEditor(image: box.image,
@@ -108,6 +115,7 @@ struct WelcomeScreen: View {
     let busy: Job?
     let onPhotos: () -> Void
     let onFiles: () -> Void
+    let onLink: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -141,6 +149,15 @@ struct WelcomeScreen: View {
                         .foregroundStyle(.black)
                         .background(Theme.accent, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                     }
+                    Button(action: onLink) {
+                        HStack {
+                            Text("Paste a Twitch / Kick link").font(.system(size: 16, weight: .semibold))
+                            Spacer()
+                            Image(systemName: "link").font(.system(size: 15))
+                        }
+                        .padding(.horizontal, 20).frame(height: 54)
+                        .panel(16)
+                    }
                     Button(action: onFiles) {
                         HStack {
                             Text("From Files").font(.system(size: 16, weight: .semibold))
@@ -166,6 +183,7 @@ struct EditorScreen: View {
     @Binding var tab: EditorTab
     let onPhotos: () -> Void
     let onFiles: () -> Void
+    let onLink: () -> Void
     let onSettings: () -> Void
 
     var body: some View {
@@ -184,6 +202,7 @@ struct EditorScreen: View {
             Menu {
                 Button("From Photos", systemImage: "photo.on.rectangle", action: onPhotos)
                 Button("From Files", systemImage: "folder", action: onFiles)
+                Button("From a link", systemImage: "link", action: onLink)
             } label: {
                 Image(systemName: "plus").font(.system(size: 16, weight: .bold))
                     .frame(width: 40, height: 40).panel(12)
@@ -196,7 +215,9 @@ struct EditorScreen: View {
 
             Spacer()
 
-            if let job = model.exportJob {
+            if let job = model.importJob {
+                ExportProgress(job: job) { }
+            } else if let job = model.exportJob {
                 ExportProgress(job: job) { model.cancelExport() }
             } else {
                 Button { model.exportCurrent() } label: {
