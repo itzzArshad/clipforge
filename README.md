@@ -1,20 +1,18 @@
-# ClipForge
+# ClipForge v0.2
 
-Native SwiftUI app: import a long video, find loud/exciting moments, trim, cut silences, export 9:16 (1080x1920) to Photos.
-Steps 1-3 of the plan (import + player/trim, 9:16 export, audio peak + silence detection). Transcription (WhisperKit) comes next.
+Long video -> vertical reel, on the phone.
 
-## Build the IPA with no Mac
-1. Create a GitHub repo and push this folder (public repos get free macOS minutes; private ones burn them ~10x faster).
-2. Actions tab -> "Build unsigned IPA" -> Run workflow (it also runs on every push to main).
-3. When it finishes, download the `ClipForge-unsigned-ipa` artifact and unzip it to get `ClipForge-unsigned.ipa`.
+- Finds loud/hype moments (language independent), trim, cut silences
+- Layouts: **Fit + blur** (full frame, nothing cropped, blurred fill behind) or **Fill** (crop with pan)
+- Captions: WhisperKit (on-device) with word timestamps, Hindi + other Indian languages
+- Signature look ("Hype mode"): captions react to how loud each word is (loud words get bigger and hot-coloured, the active word pops),
+  punch-in zoom on shouts, and a live hype meter bar driven by the streamer's audio, plus an optional hook line
 
-## Sign it with your cert
-Set the bundle ID in `project.yml` (PRODUCT_BUNDLE_IDENTIFIER) to match your provisioning profile's App ID, push again, then sign:
-
-    zsign -k cert.p12 -p <password> -m profile.mobileprovision -o ClipForge.ipa ClipForge-unsigned.ipa
-
-or use Sideloadly / an on-device signer with the unsigned IPA.
+## Build
+Push to GitHub (public repo = free macOS minutes) -> Actions -> "Build unsigned IPA" -> download artifact -> sign with Feather.
+Set PRODUCT_BUNDLE_IDENTIFIER in project.yml to match your profile if needed.
 
 ## Notes
-- Silence threshold is -40 dBFS (AudioAnalyzer.keepRanges). Game audio is rarely truly silent; tune it per stream.
-- Imported videos are copied to the temp folder, so keep free storage for multi-GB streams.
+- First caption run downloads the Whisper model from Hugging Face (needs internet). "small" is fast; the accurate model is much better on Hinglish but slower and warmer.
+- First load of a model compiles it for the Neural Engine and can take a minute or more. Later runs are faster.
+- Silence threshold is -40 dBFS in AudioAnalyzer.keepRanges.

@@ -6,13 +6,20 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "0.1"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.2"
+    CURRENT_PROJECT_VERSION: "2"
+packages:
+  ArgmaxOSS:
+    url: https://github.com/argmaxinc/argmax-oss-swift
+    from: 1.1.1
 targets:
   ClipForge:
     type: application
     platform: iOS
     sources: [ClipForge]
+    dependencies:
+      - package: ArgmaxOSS
+        product: WhisperKit
     info:
       path: ClipForge/Info.plist
       properties:

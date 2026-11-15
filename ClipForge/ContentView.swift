@@ -17,6 +17,21 @@ struct VideoFile: Transferable {
     }
 }
 
+struct Lang: Identifiable, Hashable {
+    let code: String
+    let name: String
+    var id: String { code }
+}
+
+let languages: [Lang] = [
+    Lang(code: "hi", name: "Hindi"), Lang(code: "en", name: "English"),
+    Lang(code: "te", name: "Telugu"), Lang(code: "ta", name: "Tamil"),
+    Lang(code: "kn", name: "Kannada"), Lang(code: "ml", name: "Malayalam"),
+    Lang(code: "mr", name: "Marathi"), Lang(code: "bn", name: "Bengali"),
+    Lang(code: "gu", name: "Gujarati"), Lang(code: "pa", name: "Punjabi"),
+    Lang(code: "ur", name: "Urdu")
+]
+
 struct ContentView: View {
     @State private var pickerItem: PhotosPickerItem?
     @State private var showFiles = false
@@ -27,10 +42,21 @@ struct ContentView: View {
     @State private var start: Double = 0
     @State private var end: Double = 30
     @State private var removeSilence = true
-    @State private var panX: Double = 0.5
     @State private var status = "Pick a video to begin"
     @State private var busy = false
     @State private var player = AVPlayer()
+
+    // reel style
+    @State private var layout: ReelLayout = .fit
+    @State private var panX: Double = 0.5
+    @State private var captions = true
+    @State private var punch = true
+    @State private var hype = true
+    @State private var hook = ""
+    @State private var language = "hi"
+    @State private var accurateModel = false
+
+    @State private var transcriber = Transcriber()
 
     var body: some View {
         NavigationStack {
@@ -46,7 +72,7 @@ struct ContentView: View {
 
                 if videoURL != nil {
                     Section("Preview") {
-                        VideoPlayer(player: player).frame(height: 260)
+                        VideoPlayer(player: player).frame(height: 240)
                     }
                     Section("Candidates (loudest moments)") {
                         ForEach(highlights) { h in
@@ -66,17 +92,34 @@ struct ContentView: View {
                                 seek(v)
                             }
                         Slider(value: $end, in: (start + 1)...max(duration, start + 2))
-                    }
-                    Section("Options") {
                         Toggle("Remove silences", isOn: $removeSilence)
-                        VStack(alignment: .leading) {
-                            Text("Crop position (left → right)").font(.footnote)
-                            Slider(value: $panX, in: 0...1)
+                    }
+                    Section("Look") {
+                        Picker("Layout", selection: $layout) {
+                            ForEach(ReelLayout.allCases) { Text($0.rawValue).tag($0) }
+                        }.pickerStyle(.segmented)
+                        if layout == .fill {
+                            VStack(alignment: .leading) {
+                                Text("Crop position (left → right)").font(.footnote)
+                                Slider(value: $panX, in: 0...1)
+                            }
+                        }
+                        Toggle("Punch-in zoom on loud moments", isOn: $punch)
+                        Toggle("Hype meter bar", isOn: $hype)
+                        TextField("Hook text (first 2.5 s, optional)", text: $hook)
+                    }
+                    Section("Captions") {
+                        Toggle("Burn in captions", isOn: $captions)
+                        if captions {
+                            Picker("Spoken language", selection: $language) {
+                                ForEach(languages) { Text($0.name).tag($0.code) }
+                            }
+                            Toggle("Accurate model (slower, ~600 MB download)", isOn: $accurateModel)
                         }
                     }
                     Section {
                         Button { Task { await export() } } label: {
-                            Text("Export 1080×1920 to Photos").bold()
+                            Text("Make reel → Photos").bold()
                         }.disabled(busy)
                     }
                 }
@@ -145,18 +188,41 @@ struct ContentView: View {
     func export() async {
         guard let url = videoURL else { return }
         busy = true
-        status = "Exporting…"
+        defer { busy = false }
         do {
+            status = "Cutting…"
             let keep = removeSilence
                 ? AudioAnalyzer.keepRanges(bins: bins, start: start, end: end)
                 : [start...end]
-            let out = try await Exporter.export(url: url, keep: keep, panX: panX)
+            let built = try await Exporter.build(url: url, keep: keep)
+
+            status = "Analyzing the edited clip…"
+            let samples = try await AudioAnalyzer.samples(asset: built.comp)
+            let clipBins = AudioAnalyzer.bins(fromSamples: samples)
+            let levels = AudioAnalyzer.levels(bins: clipBins)
+
+            var pages: [CaptionPage] = []
+            if captions && !samples.isEmpty {
+                status = "Transcribing… (first run downloads the model)"
+                let raw = try await transcriber.words(
+                    samples: samples,
+                    model: accurateModel ? "large-v3-v20240930_626MB" : "small",
+                    language: language)
+                pages = CaptionBuilder.pages(from: CaptionBuilder.words(from: raw, norm: levels.norm))
+            }
+
+            status = "Rendering…"
+            let cfg = ReelConfig(layout: layout, panX: panX, punch: punch, hype: hype,
+                                 hookText: hook.trimmingCharacters(in: .whitespaces),
+                                 showCaptions: captions, orientation: built.orientation,
+                                 levels: levels, pages: pages)
+            let out = try await Exporter.render(built, config: cfg)
             try await Exporter.saveToPhotos(out)
-            status = "Saved to Photos ✓"
+            try? FileManager.default.removeItem(at: out)
+            status = "Saved to Photos ✓  (\(pages.count) caption pages)"
         } catch {
-            status = "Export failed: \(error.localizedDescription)"
+            status = "Failed: \(error.localizedDescription)"
         }
-        busy = false
     }
 
     func fmt(_ t: Double) -> String {

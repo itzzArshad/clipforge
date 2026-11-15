@@ -8,17 +8,17 @@ struct Highlight: Identifiable {
     let score: Float
 }
 
-/// Language-independent analysis: loudness curve -> highlight windows + silence ranges.
+struct Levels {
+    let norm: [Float]   // 0...1 loudness per bin
+    let env: [Float]    // same, with fast attack / slow decay (used for zoom + hype meter)
+}
+
 enum AudioAnalyzer {
     static let binSeconds = 0.1
     static let sampleRate = 16000
 
-    /// Returns loudness in dBFS per 0.1s bin. Streams the file; never loads it whole.
-    static func loudness(url: URL) async throws -> [Float] {
-        let asset = AVURLAsset(url: url)
-        guard let track = try await asset.loadTracks(withMediaType: .audio).first else { return [] }
-        let reader = try AVAssetReader(asset: asset)
-        let settings: [String: Any] = [
+    static var pcmSettings: [String: Any] {
+        [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVSampleRateKey: sampleRate,
             AVNumberOfChannelsKey: 1,
@@ -27,7 +27,25 @@ enum AudioAnalyzer {
             AVLinearPCMIsBigEndianKey: false,
             AVLinearPCMIsNonInterleaved: false
         ]
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+    }
+
+    private static func floats(from sb: CMSampleBuffer) -> [Float] {
+        guard let block = CMSampleBufferGetDataBuffer(sb) else { return [] }
+        let length = CMBlockBufferGetDataLength(block)
+        var data = [Float](repeating: 0, count: length / MemoryLayout<Float>.size)
+        data.withUnsafeMutableBytes {
+            _ = CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!)
+        }
+        return data
+    }
+
+    // MARK: Full-stream analysis (streams from disk, safe for multi-hour files)
+
+    static func loudness(url: URL) async throws -> [Float] {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .audio).first else { return [] }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: pcmSettings)
         reader.add(output)
         guard reader.startReading() else { throw reader.error ?? CocoaError(.fileReadUnknown) }
 
@@ -37,12 +55,7 @@ enum AudioAnalyzer {
         var count = 0
 
         while let sb = output.copyNextSampleBuffer() {
-            guard let block = CMSampleBufferGetDataBuffer(sb) else { continue }
-            let length = CMBlockBufferGetDataLength(block)
-            var data = [Float](repeating: 0, count: length / MemoryLayout<Float>.size)
-            data.withUnsafeMutableBytes {
-                _ = CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!)
-            }
+            let data = floats(from: sb)
             var i = 0
             while i < data.count {
                 let n = min(binSize - count, data.count - i)
@@ -52,8 +65,7 @@ enum AudioAnalyzer {
                 count += n
                 i += n
                 if count == binSize {
-                    let rms = sqrt(sumSq / Float(binSize))
-                    bins.append(20 * log10(max(rms, 1e-6)))
+                    bins.append(20 * log10(max(sqrt(sumSq / Float(binSize)), 1e-6)))
                     sumSq = 0
                     count = 0
                 }
@@ -62,7 +74,56 @@ enum AudioAnalyzer {
         return bins
     }
 
-    /// Picks the loudest non-overlapping windows. Score = total dB above the stream's mean level.
+    // MARK: Short-clip helpers (whole clip in memory; fine for 30-90 s)
+
+    /// 16 kHz mono float samples of an asset (works on an AVComposition, so timing matches the edited clip).
+    static func samples(asset: AVAsset) async throws -> [Float] {
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        guard !tracks.isEmpty else { return [] }
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: pcmSettings)
+        reader.add(output)
+        guard reader.startReading() else { throw reader.error ?? CocoaError(.fileReadUnknown) }
+        var all: [Float] = []
+        while let sb = output.copyNextSampleBuffer() { all.append(contentsOf: floats(from: sb)) }
+        return all
+    }
+
+    static func bins(fromSamples s: [Float]) -> [Float] {
+        let binSize = Int(Double(sampleRate) * binSeconds)
+        guard s.count >= binSize else { return [] }
+        var out: [Float] = []
+        var i = 0
+        while i + binSize <= s.count {
+            var ss: Float = 0
+            s.withUnsafeBufferPointer { vDSP_svesq($0.baseAddress! + i, 1, &ss, vDSP_Length(binSize)) }
+            out.append(20 * log10(max(sqrt(ss / Float(binSize)), 1e-6)))
+            i += binSize
+        }
+        return out
+    }
+
+    static func levels(bins: [Float]) -> Levels {
+        guard bins.count > 10 else {
+            let z = [Float](repeating: 0, count: bins.count)
+            return Levels(norm: z, env: z)
+        }
+        let sorted = bins.sorted()
+        let lo = sorted[Int(Double(sorted.count) * 0.2)]
+        let hi = sorted[min(Int(Double(sorted.count) * 0.97), sorted.count - 1)]
+        let range = max(hi - lo, 6)
+        let norm = bins.map { min(max(($0 - lo) / range, 0), 1) }
+        var env = norm
+        var prev: Float = 0
+        for i in 0..<env.count {
+            prev = max(norm[i], prev * 0.9)
+            env[i] = prev
+        }
+        return Levels(norm: norm, env: env)
+    }
+
+    // MARK: Highlights + silence
+
     static func highlights(bins: [Float], windowSeconds: Double = 45, count: Int = 12) -> [Highlight] {
         guard !bins.isEmpty else { return [] }
         let w = Int(windowSeconds / binSeconds)
@@ -93,7 +154,6 @@ enum AudioAnalyzer {
         return picked.sorted { $0.start < $1.start }
     }
 
-    /// Ranges to KEEP inside [start, end] after cutting silences longer than minSilence.
     static func keepRanges(bins: [Float], start: Double, end: Double,
                            thresholdDB: Float = -40, minSilence: Double = 1.0,
                            pad: Double = 0.15) -> [ClosedRange<Double>] {
