@@ -4,7 +4,7 @@ import ImageIO
 import UIKit
 
 enum ReelLayout: String, CaseIterable, Identifiable {
-    case fit = "Fit", fill = "Fill"
+    case stream = "Stream", fit = "Fit", fill = "Fill"
     var id: String { rawValue }
 }
 enum ReelBackground: String, CaseIterable, Identifiable {
@@ -15,42 +15,88 @@ enum CaptionStyleKind: String, CaseIterable, Identifiable {
     case pill = "Pill", pop = "Pop", clean = "Clean"
     var id: String { rawValue }
 }
+enum CaptionScript: String, CaseIterable, Identifiable {
+    case hinglish = "Hinglish", native = "Native"
+    var id: String { rawValue }
+}
 
 struct ReelStyle: Equatable {
     var layout: ReelLayout = .fit
     var background: ReelBackground = .aura
     var panX: Double = 0.5
+    var facecam: CGRect? = nil          // normalised, top-left origin, in the source frame
+    var camShare: Double = 0.40         // stream layout: height share of the facecam panel
+
     var punch = true
-    var hype = true
+    var hype = false
+    var slam = true                     // "peak slam": flash + giant word on the loudest moment
+    var progressBar = true              // retention bar along the top
+
     var captionsOn = true
     var captionStyle: CaptionStyleKind = .pill
+    var script: CaptionScript = .hinglish
     var accent = 0
     var hook = ""
+
+    var watermarkOn = false
+    var watermarkText = "@yourhandle"
+    var watermarkPos: WatermarkPosition = .topRight
+    var watermarkLook: WatermarkLook = .tag
+    var watermarkOpacity = 0.85
+    var watermarkSize = 1.0
 }
 
-/// Shared, thread-safe render state. The preview player and the exporter both read it every frame,
-/// so changing a style value updates the live preview instantly.
+struct SlamCue: Equatable {
+    var time: Double     // composition time
+    var word: String
+}
+
+/// Shared, thread-safe render state. The preview player and the exporter read it every frame,
+/// so changing a style value updates the live preview instantly. Each export gets its own copy.
 final class ReelState {
     let orientation: CGImagePropertyOrientation
     private let lock = NSLock()
     private var _style = ReelStyle()
     private var _levels = Levels(norm: [], env: [])
     private var _pages: [CaptionPage] = []
+    private var _slam: SlamCue?
+    private var _duration = 0.0
+    private var _logo: UIImage?
     private var cache: [String: CIImage] = [:]
 
     init(orientation: CGImagePropertyOrientation) { self.orientation = orientation }
 
+    private func locked<T>(_ f: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return f() }
+
     var style: ReelStyle {
-        get { lock.lock(); defer { lock.unlock() }; return _style }
-        set { lock.lock(); _style = newValue; cache.removeAll(); lock.unlock() }
+        get { locked { _style } }
+        set { locked { _style = newValue; cache.removeAll() } }
     }
     var levels: Levels {
-        get { lock.lock(); defer { lock.unlock() }; return _levels }
-        set { lock.lock(); _levels = newValue; lock.unlock() }
+        get { locked { _levels } }
+        set { locked { _levels = newValue } }
     }
     var pages: [CaptionPage] {
-        get { lock.lock(); defer { lock.unlock() }; return _pages }
-        set { lock.lock(); _pages = newValue; cache.removeAll(); lock.unlock() }
+        get { locked { _pages } }
+        set { locked { _pages = newValue; cache.removeAll() } }
+    }
+    var slam: SlamCue? {
+        get { locked { _slam } }
+        set { locked { _slam = newValue; cache.removeValue(forKey: "slam") } }
+    }
+    var duration: Double {
+        get { locked { _duration } }
+        set { locked { _duration = newValue } }
+    }
+    var logo: UIImage? {
+        get { locked { _logo } }
+        set { locked { _logo = newValue; cache.removeValue(forKey: "wm") } }
+    }
+
+    func copy() -> ReelState {
+        let s = ReelState(orientation: orientation)
+        s.style = style; s.levels = levels; s.pages = pages; s.slam = slam; s.duration = duration; s.logo = logo
+        return s
     }
 
     // MARK: helpers
@@ -65,11 +111,14 @@ final class ReelState {
     }
 
     private func cached(_ key: String, _ make: () -> CIImage) -> CIImage {
-        lock.lock(); defer { lock.unlock() }
-        if let c = cache[key] { return c }
-        if cache.count > 40 { cache.removeAll() }
+        lock.lock()
+        if let c = cache[key] { lock.unlock(); return c }
+        lock.unlock()
         let img = make()
+        lock.lock()
+        if cache.count > 60 { cache.removeAll() }
         cache[key] = img
+        lock.unlock()
         return img
     }
 
@@ -85,6 +134,20 @@ final class ReelState {
         f.setValue(radius, forKey: "inputRadius")
         f.setValue(color, forKey: "inputColor")
         return f.outputImage?.cropped(to: rect)
+    }
+
+    private func solid(_ rect: CGRect, _ color: CIColor) -> CIImage {
+        CIImage(color: color).cropped(to: rect)
+    }
+
+    /// Scales `img` to cover `rect` (crop the overflow), with a horizontal pan 0...1.
+    private func cover(_ img: CIImage, into rect: CGRect, zoom: CGFloat = 1, panX: CGFloat = 0.5) -> CIImage {
+        let e = img.extent
+        let s = max(rect.width / e.width, rect.height / e.height) * zoom
+        let tx = rect.minX - (e.width * s - rect.width) * panX - e.minX * s
+        let ty = rect.minY - (e.height * s - rect.height) / 2 - e.minY * s
+        return img.transformed(by: CGAffineTransform(scaleX: s, y: s).concatenating(CGAffineTransform(translationX: tx, y: ty)))
+            .cropped(to: rect)
     }
 
     /// Two-stage downscale -> blur -> smooth upscale. Much cleaner than a single big blur.
@@ -109,7 +172,7 @@ final class ReelState {
         var bg: CIImage
         switch kind {
         case .black:
-            return CIImage(color: CIColor(red: 0.02, green: 0.02, blue: 0.03)).cropped(to: canvas)
+            return solid(canvas, CIColor(red: 0.04, green: 0.04, blue: 0.045))
         case .blur:
             bg = smooth(src, W: W, H: H, down: 4, zoom: 1.4, sigma1: 12 * k, sigma2: 7 * k)
         case .aura:
@@ -140,35 +203,74 @@ final class ReelState {
         return nil
     }
 
+    private func withAlpha(_ img: CIImage, _ a: CGFloat) -> CIImage {
+        img.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: a)])
+    }
+
+    private func accentCI(_ accent: Int, alpha: CGFloat = 1) -> CIColor {
+        let c = CaptionRenderer.palette[min(max(accent, 0), CaptionRenderer.palette.count - 1)]
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        c.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return CIColor(red: r, green: g, blue: b, alpha: alpha)
+    }
+
     // MARK: per-frame render
 
     func frame(from src: CIImage, at t: Double, size: CGSize) -> CIImage {
-        lock.lock(); let st = _style; let lv = _levels; let pg = _pages; lock.unlock()
+        lock.lock()
+        let st = _style, lv = _levels, pg = _pages, slam = _slam, dur = _duration, logo = _logo
+        lock.unlock()
 
         let W = size.width, H = size.height, k = W / 1080
         let canvas = CGRect(origin: .zero, size: size)
         let env = sample(lv.env, t)
-        let maxPunch: CGFloat = st.layout == .fit ? 0.05 : 0.10
-        let zoom: CGFloat = 1 + (st.punch ? maxPunch * CGFloat(env * env) : 0)
         let ext = src.extent
         var out: CIImage
         var captionCenterY: CGFloat = 520 * k
+        var hookTop: CGFloat = H - 470 * k
+
+        // slam timing
+        var slamAge: Double? = nil
+        if st.slam, let s = slam, t >= s.time, t < s.time + 0.95 { slamAge = t - s.time }
+        let slamPunch: CGFloat = slamAge.map { CGFloat(max(0, 1 - $0 / 0.35)) } ?? 0
 
         switch st.layout {
+        case .stream:
+            let topH = (H * CGFloat(st.camShare)).rounded()
+            let gameRect = CGRect(x: 0, y: 0, width: W, height: H - topH)
+            let camRect = CGRect(x: 0, y: H - topH, width: W, height: topH)
+            let zoom: CGFloat = 1 + (st.punch ? 0.10 * CGFloat(env * env) : 0) + 0.06 * slamPunch
+            out = solid(canvas, CIColor(red: 0.04, green: 0.04, blue: 0.045))
+            out = cover(src, into: gameRect, zoom: zoom, panX: CGFloat(st.panX)).composited(over: out)
+            if let f = st.facecam {
+                let cr = CGRect(x: ext.minX + f.minX * ext.width, y: ext.minY + (1 - f.maxY) * ext.height,
+                                width: f.width * ext.width, height: f.height * ext.height)
+                let cam = src.cropped(to: cr)
+                let camZoom: CGFloat = 1 + 0.04 * CGFloat(env)
+                out = cover(cam, into: camRect, zoom: camZoom).composited(over: out)
+            } else {
+                out = background(src, kind: .aura, W: W, H: H, k: k).cropped(to: camRect).composited(over: out)
+            }
+            // seam: accent bar that thickens and brightens with the streamer's voice
+            let seamH = (6 + 10 * CGFloat(env)) * k
+            let seam = CGRect(x: 0, y: camRect.minY - seamH / 2, width: W, height: seamH)
+            out = solid(seam, accentCI(st.accent, alpha: 0.55 + 0.45 * CGFloat(env))).composited(over: out)
+            captionCenterY = gameRect.maxY - 210 * k
+            hookTop = H - 300 * k
+
         case .fill:
-            let s = max(W / ext.width, H / ext.height) * zoom
-            let tx = -(ext.width * s - W) * CGFloat(st.panX)
-            let ty = -(ext.height * s - H) / 2
-            out = src.transformed(by: CGAffineTransform(scaleX: s, y: s)
-                .concatenating(CGAffineTransform(translationX: tx, y: ty)))
+            let zoom: CGFloat = 1 + (st.punch ? 0.10 * CGFloat(env * env) : 0) + 0.06 * slamPunch
+            out = cover(src, into: canvas, zoom: zoom, panX: CGFloat(st.panX))
+
         case .fit:
+            let zoom: CGFloat = 1 + (st.punch ? 0.05 * CGFloat(env * env) : 0) + 0.04 * slamPunch
             let bg = background(src, kind: st.background, W: W, H: H, k: k)
             let sf = min(W / ext.width, H / ext.height) * zoom
             let fw = ext.width * sf, fh = ext.height * sf
             let shift: CGFloat = fh < H * 0.8 ? 90 * k : 0
             let rect = CGRect(x: (W - fw) / 2, y: (H - fh) / 2 + shift, width: fw, height: fh)
             let fg = src.transformed(by: CGAffineTransform(scaleX: sf, y: sf)
-                .concatenating(CGAffineTransform(translationX: rect.minX, y: rect.minY)))
+                .concatenating(CGAffineTransform(translationX: rect.minX - ext.minX * sf, y: rect.minY - ext.minY * sf)))
             if fw < W - 1 || fh < H - 1,
                let mask = roundedRect(rect, radius: 38 * k, color: .white) {
                 let blended = fg.cropped(to: rect).applyingFilter("CIBlendWithAlphaMask", parameters: [
@@ -180,26 +282,72 @@ final class ReelState {
             captionCenterY = max(440 * k, rect.minY - 230 * k)
         }
 
+        // hype meter (optional, sits above the bottom UI of Reels/Shorts)
         if st.hype {
             let level = CGFloat(env)
             let h = 12 * k
-            let track = CGRect(x: 90 * k, y: H - 130 * k, width: W - 180 * k, height: h)
+            let track = CGRect(x: 90 * k, y: 150 * k, width: W - 180 * k, height: h)
             let fillRect = CGRect(x: track.minX, y: track.minY, width: max(h, track.width * level), height: h)
             if let t1 = roundedRect(track, radius: h / 2, color: CIColor(red: 1, green: 1, blue: 1, alpha: 0.18)),
-               let t2 = roundedRect(fillRect, radius: h / 2,
-                                    color: CIColor(red: 1, green: 0.85 - 0.6 * level, blue: 0.15, alpha: 1)) {
+               let t2 = roundedRect(fillRect, radius: h / 2, color: accentCI(st.accent)) {
                 out = t2.composited(over: t1.composited(over: out))
             }
         }
 
+        // retention bar along the very top
+        if st.progressBar, dur > 0 {
+            let h = 8 * k
+            let p = CGFloat(min(max(t / dur, 0), 1))
+            out = solid(CGRect(x: 0, y: H - h, width: W, height: h), CIColor(red: 1, green: 1, blue: 1, alpha: 0.15)).composited(over: out)
+            out = solid(CGRect(x: 0, y: H - h, width: W * p, height: h), accentCI(st.accent)).composited(over: out)
+        }
+
+        // watermark
+        if st.watermarkOn, !(st.watermarkText.isEmpty && logo == nil) {
+            let img = cached("wm") {
+                Overlay.watermark(text: st.watermarkText, logo: logo, look: st.watermarkLook, accent: st.accent, size: st.watermarkSize)
+            }
+            let iw = img.extent.width * k, ih = img.extent.height * k
+            let m = 40 * k
+            let top = H - 70 * k - ih
+            var p = CGPoint(x: m, y: top)
+            switch st.watermarkPos {
+            case .topLeft: p = CGPoint(x: m, y: top)
+            case .topRight: p = CGPoint(x: W - m - iw, y: top)
+            case .top: p = CGPoint(x: (W - iw) / 2, y: top)
+            case .bottomLeft: p = CGPoint(x: m, y: 240 * k)
+            case .bottomRight: p = CGPoint(x: W - m - iw, y: 240 * k)
+            case .center: p = CGPoint(x: (W - iw) / 2, y: (H - ih) / 2)
+            }
+            let placed = img.transformed(by: CGAffineTransform(scaleX: k, y: k)
+                .concatenating(CGAffineTransform(translationX: p.x, y: p.y)))
+            out = withAlpha(placed, CGFloat(st.watermarkOpacity)).composited(over: out)
+        }
+
+        // hook sticker for the first 2.5 s
         let hook = st.hook.trimmingCharacters(in: .whitespaces)
         if !hook.isEmpty && t < 2.5 {
             let img = cached("hook") { CaptionRenderer.hook(hook, accent: st.accent) }
-            let tr = CGAffineTransform(scaleX: k, y: k).concatenating(CGAffineTransform(translationX: 0, y: H - 470 * k))
-            out = img.transformed(by: tr).composited(over: out)
+            let intro = CGFloat(min(1, t / 0.18))
+            let s = k * (0.85 + 0.15 * intro)
+            let tr = CGAffineTransform(translationX: -img.extent.midX, y: -img.extent.midY)
+                .concatenating(CGAffineTransform(scaleX: s, y: s))
+                .concatenating(CGAffineTransform(translationX: W / 2, y: hookTop))
+            out = withAlpha(img.transformed(by: tr), intro).composited(over: out)
         }
 
-        if st.captionsOn, let (pi, ai) = activeCaption(pg, t) {
+        // peak slam: white flash + giant word, replaces the caption for a moment
+        if let age = slamAge, let s = slam {
+            let flash = CGFloat(max(0, 1 - age / 0.22)) * 0.55
+            if flash > 0 { out = solid(canvas, CIColor(red: 1, green: 1, blue: 1, alpha: flash)).composited(over: out) }
+            let img = cached("slam") { Overlay.slam(s.word, accent: st.accent) }
+            let pop = 1.35 - 0.35 * CGFloat(min(1, age / 0.16))
+            let fade = CGFloat(age > 0.75 ? max(0, 1 - (age - 0.75) / 0.2) : 1)
+            let tr = CGAffineTransform(translationX: -img.extent.midX, y: -img.extent.midY)
+                .concatenating(CGAffineTransform(scaleX: pop * k, y: pop * k))
+                .concatenating(CGAffineTransform(translationX: W / 2, y: captionCenterY + 40 * k))
+            out = withAlpha(img.transformed(by: tr), fade).composited(over: out)
+        } else if st.captionsOn, let (pi, ai) = activeCaption(pg, t) {
             let page = pg[pi]
             let img = cached("c\(pi)-\(ai)") {
                 CaptionRenderer.image(page: page, active: ai, style: st.captionStyle, accent: st.accent)

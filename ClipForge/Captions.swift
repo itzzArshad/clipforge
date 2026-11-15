@@ -61,15 +61,15 @@ enum CaptionRenderer {
 
     /// Accent palette. Index is stored in ReelStyle.accent.
     static let palette: [UIColor] = [
+        UIColor(red: 0.84, green: 1.00, blue: 0.25, alpha: 1),   // signal lime (ClipForge signature)
         UIColor(red: 1.00, green: 0.85, blue: 0.10, alpha: 1),   // yellow
         UIColor(red: 1.00, green: 0.30, blue: 0.60, alpha: 1),   // pink
         UIColor(red: 0.20, green: 0.90, blue: 1.00, alpha: 1),   // cyan
-        UIColor(red: 0.40, green: 1.00, blue: 0.50, alpha: 1),   // green
         UIColor(red: 1.00, green: 0.55, blue: 0.15, alpha: 1)    // orange
     ]
     static let hot = UIColor(red: 1.0, green: 0.25, blue: 0.2, alpha: 1)
 
-    private static func format() -> UIGraphicsImageRendererFormat {
+    static func format() -> UIGraphicsImageRendererFormat {
         let f = UIGraphicsImageRendererFormat()
         f.scale = 1
         f.opaque = false
@@ -200,7 +200,7 @@ enum CaptionRenderer {
             .foregroundColor: UIColor.black,
             .paragraphStyle: para
         ])
-        let bound = attr.boundingRect(with: CGSize(width: 820, height: .greatestFiniteMagnitude),
+        let bound = attr.boundingRect(with: CGSize(width: 820, height: CGFloat.greatestFiniteMagnitude),
                                       options: .usesLineFragmentOrigin, context: nil)
         let pill = CGRect(x: (hookSize.width - (bound.width + 80)) / 2,
                           y: (hookSize.height - (bound.height + 50)) / 2,

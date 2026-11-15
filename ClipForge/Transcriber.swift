@@ -5,6 +5,7 @@ struct RawWord {
     var text: String
     var start: Double
     var end: Double
+    var fixed = false      // typed or corrected by the user/AI: shown as-is, never transliterated
 }
 
 /// On-device Whisper via WhisperKit (Core ML). First use downloads the model from Hugging Face.
