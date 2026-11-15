@@ -6,17 +6,15 @@ struct TimelineSection: View {
     var body: some View {
         VStack(spacing: 6) {
             HStack(spacing: 8) {
-                Text(clock(model.start)).font(.system(size: 12, weight: .semibold, design: .monospaced))
+                Text("IN " + clock(model.start)).font(Theme.mono(11, .semibold))
                 Spacer()
-                Text("\(Int(model.end - model.start)) s clip")
-                    .font(.system(size: 12, weight: .bold))
-                    .padding(.horizontal, 10).padding(.vertical, 4)
-                    .background(.white.opacity(0.14), in: Capsule())
+                Text(String(format: "%.1fs", model.end - model.start))
+                    .font(Theme.mono(12, .bold)).foregroundStyle(Theme.accent)
                 Spacer()
-                Text(clock(model.end)).font(.system(size: 12, weight: .semibold, design: .monospaced))
+                Text("OUT " + clock(model.end)).font(Theme.mono(11, .semibold))
             }
-            .foregroundStyle(.white.opacity(0.8))
-            .padding(.horizontal, 6)
+            .foregroundStyle(Theme.dim)
+            .padding(.horizontal, 4)
 
             HStack(spacing: 8) {
                 TimelineStrip(model: model).frame(height: 62)
@@ -33,7 +31,7 @@ struct TimelineSection: View {
             }
         }
         .padding(10)
-        .glass(26)
+        .panel()
     }
 
     private func tool(_ icon: String, _ action: @escaping () -> Void) -> some View {
@@ -41,7 +39,7 @@ struct TimelineSection: View {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .semibold))
                 .frame(width: 28, height: 28)
-                .background(.white.opacity(0.12), in: Circle())
+                .background(Theme.raised, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
     }

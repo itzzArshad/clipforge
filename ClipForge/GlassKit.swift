@@ -1,8 +1,22 @@
 import SwiftUI
 import AVFoundation
 
+/// ClipForge look: a dark "control room" — graphite surfaces, hairline borders, one signal-lime
+/// accent, monospaced timecodes and small uppercase labels. Glass is only used for chrome that
+/// floats over video.
 enum Theme {
-    static let accent = Color(red: 0.62, green: 0.40, blue: 1.0)
+    static let bg = Color(red: 0.035, green: 0.035, blue: 0.04)
+    static let surface = Color(red: 0.085, green: 0.085, blue: 0.095)
+    static let raised = Color(red: 0.13, green: 0.13, blue: 0.145)
+    static let line = Color.white.opacity(0.08)
+    static let dim = Color.white.opacity(0.55)
+    static let faint = Color.white.opacity(0.32)
+    static let accent = Color(red: 0.84, green: 1.0, blue: 0.25)
+    static let hot = Color(red: 1.0, green: 0.36, blue: 0.24)
+
+    static func mono(_ size: CGFloat, _ weight: Font.Weight = .medium) -> Font {
+        .system(size: size, weight: weight, design: .monospaced)
+    }
 }
 
 func clock(_ t: Double) -> String {
@@ -42,20 +56,23 @@ extension View {
             .background((tint ?? .clear).opacity(0.35), in: RoundedRectangle(cornerRadius: radius, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(.white.opacity(0.14), lineWidth: 1))
     }
+
+    /// Flat panel used for the editor's tool areas.
+    func panel(_ radius: CGFloat = 18) -> some View {
+        self
+            .background(Theme.surface, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Theme.line, lineWidth: 1))
+    }
 }
 
-struct AmbientBackground: View {
+/// Small uppercase section label: "CAPTIONS · 3 WORDS".
+struct SectionLabel: View {
+    let text: String
     var body: some View {
-        ZStack {
-            Color(red: 0.03, green: 0.03, blue: 0.07)
-            Circle().fill(Color(red: 0.55, green: 0.30, blue: 1.0).opacity(0.45))
-                .frame(width: 320, height: 320).blur(radius: 90).offset(x: -120, y: -260)
-            Circle().fill(Color(red: 0.10, green: 0.80, blue: 1.0).opacity(0.30))
-                .frame(width: 300, height: 300).blur(radius: 100).offset(x: 140, y: 120)
-            Circle().fill(Color(red: 1.0, green: 0.30, blue: 0.60).opacity(0.25))
-                .frame(width: 260, height: 260).blur(radius: 90).offset(x: -100, y: 330)
-        }
-        .ignoresSafeArea()
+        Text(text.uppercased())
+            .font(.system(size: 10.5, weight: .bold))
+            .tracking(1.4)
+            .foregroundStyle(Theme.faint)
     }
 }
 
@@ -68,15 +85,94 @@ struct Chip: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 5) {
-                if let icon { Image(systemName: icon) }
+                if let icon { Image(systemName: icon).font(.system(size: 11, weight: .bold)) }
                 Text(title)
             }
             .font(.system(size: 13, weight: .semibold))
-            .padding(.horizontal, 12).padding(.vertical, 8)
+            .padding(.horizontal, 12).frame(height: 32)
             .foregroundStyle(selected ? Color.black : Color.white)
-            .background(selected ? Color.white : Color.white.opacity(0.12), in: Capsule())
+            .background(selected ? Theme.accent : Theme.raised, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// Segmented control in house style (the system one looks generic on this palette).
+struct Segments<T: Hashable & Identifiable>: View {
+    let items: [T]
+    let label: (T) -> String
+    @Binding var value: T
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(items) { it in
+                Button { withAnimation(.snappy(duration: 0.2)) { value = it } } label: {
+                    Text(label(it))
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(maxWidth: .infinity).frame(height: 30)
+                        .foregroundStyle(value == it ? Color.black : Theme.dim)
+                        .background { if value == it { RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.accent) } }
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(3)
+        .background(Theme.raised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+/// Inline status for a background job: label, detail and a thin progress line.
+struct JobRow: View {
+    let job: Job
+    var onCancel: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                PulseDot()
+                Text(job.title).font(.system(size: 12.5, weight: .semibold))
+                if !job.detail.isEmpty { Text(job.detail).font(Theme.mono(11)).foregroundStyle(Theme.dim) }
+                Spacer()
+                if let p = job.progress { Text("\(Int(p * 100))%").font(Theme.mono(12, .semibold)).foregroundStyle(Theme.accent) }
+                if let onCancel {
+                    Button(action: onCancel) { Image(systemName: "xmark").font(.system(size: 11, weight: .bold)) }
+                        .buttonStyle(.plain).foregroundStyle(Theme.dim)
+                }
+            }
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Theme.raised)
+                    if let p = job.progress {
+                        Capsule().fill(Theme.accent).frame(width: max(4, g.size.width * min(max(p, 0), 1)))
+                    } else {
+                        IndeterminateBar()
+                    }
+                }
+            }
+            .frame(height: 3)
+        }
+    }
+}
+
+struct PulseDot: View {
+    @State private var on = false
+    var body: some View {
+        Circle().fill(Theme.accent).frame(width: 7, height: 7)
+            .opacity(on ? 1 : 0.3)
+            .onAppear { withAnimation(.easeInOut(duration: 0.7).repeatForever()) { on = true } }
+    }
+}
+
+struct IndeterminateBar: View {
+    @State private var x: CGFloat = -0.3
+    var body: some View {
+        GeometryReader { g in
+            Capsule().fill(Theme.accent)
+                .frame(width: g.size.width * 0.3)
+                .offset(x: g.size.width * x)
+                .onAppear { withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) { x = 0.7 } }
+        }
+        .clipShape(Capsule())
     }
 }
 
@@ -97,32 +193,6 @@ struct PlayerView: UIViewRepresentable {
     func updateUIView(_ uiView: PlayerUIView, context: Context) {}
 }
 
-struct BusyOverlay: View {
-    let text: String
-    let progress: Double?
-    let onCancel: (() -> Void)?
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.45).ignoresSafeArea()
-            VStack(spacing: 14) {
-                if let progress {
-                    ProgressView(value: min(max(progress, 0), 1)).tint(Theme.accent).frame(width: 200)
-                } else {
-                    ProgressView().controlSize(.large)
-                }
-                Text(text).font(.system(size: 15, weight: .semibold)).multilineTextAlignment(.center)
-                if let onCancel {
-                    Button("Cancel", action: onCancel).font(.system(size: 14, weight: .semibold))
-                }
-            }
-            .padding(24)
-            .frame(maxWidth: 300)
-            .glass(28)
-        }
-    }
-}
-
 struct SettingsSheet: View {
     @AppStorage("anthropicKey") private var key = ""
     @Environment(\.dismiss) private var dismiss
@@ -137,12 +207,13 @@ struct SettingsSheet: View {
                 } header: {
                     Text("Claude API key (optional)")
                 } footer: {
-                    Text("Used only for “AI rank”. Only transcript text is sent to api.anthropic.com, never video or audio. The key is stored on this phone.")
+                    Text("Turns on: Claude cutting each short with proper context, hook titles, and Hinglish caption polish. Only transcript text is sent to api.anthropic.com, never video or audio. Typical cost is well under one US cent per stream with Claude Haiku. The key stays on this phone.")
                 }
             }
             .navigationTitle("Settings")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
         .presentationDetents([.medium])
+        .preferredColorScheme(.dark)
     }
 }

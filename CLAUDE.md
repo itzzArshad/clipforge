@@ -32,10 +32,18 @@ iPhone with Feather.
 - Captions.swift: caption words/pages, TextKit caption renderer (Pill / Pop / Clean), per-script fonts.
 - AudioAnalyzer.swift, AudioRange.swift: 0.1 s loudness bins, highlight windows, silence cutting, sample extraction.
 - Transcriber.swift: actor wrapping WhisperKit (word timestamps).
-- Moments.swift: Moment model + TextScorer (excitement lexicon, speech rate, repeats, punctuation).
-- ClaudeRanker.swift: optional Anthropic API ranking + hook titles (user key in UserDefaults "anthropicKey").
+- Moments.swift: Moment model, TextScorer (excitement lexicon, speech rate, repeats, punctuation),
+  ShortShaper (cuts a moment at sentence boundaries: setup before the peak, payoff after).
+- ClaudeRanker.swift: optional Anthropic API (user key in UserDefaults "anthropicKey"): pickShorts (start/end,
+  score, title, hook per moment) and hinglishCaptions (same word count rewrite).
+- Transliterator.swift: Devanagari -> Hinglish (tables + schwa deletion + common-word dictionary).
+- Facecam.swift: Vision-based facecam detection + manual box editor. Stream layout = facecam top, gameplay bottom.
+- Overlays.swift: watermark and "peak slam" bitmaps.
 - Exporter.swift: composition building, video composition, export, save to Photos.
-- GlassKit.swift, TimelineStrip.swift, Panels.swift, ContentView.swift: UI.
+- GlassKit.swift (Theme, Segments, JobRow), TimelineStrip.swift, Panels.swift, ContentView.swift: UI.
+  Design: graphite surfaces, hairlines, one lime accent, mono timecodes. Glass only over video.
+- Background work never blocks the UI: EditorModel jobs (importJob, analysisJob, captionJob, exportJob,
+  facecamJob) render inline in their section. Do not add modal progress overlays.
 
 ## Gotchas
 - Two timelines: source time (original video) vs composition time (after silences are cut).
