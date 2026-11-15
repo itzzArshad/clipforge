@@ -40,16 +40,21 @@ struct MomentsPanel: View {
                 }
             } else {
                 HStack(spacing: 8) {
-                    Chip(title: "Re-analyse", icon: "waveform", selected: false) { model.analyzeSpeech() }
-                    Chip(title: model.hasAPIKey ? "Claude cut" : "Add Claude", icon: "sparkles", selected: false) {
+                    Chip(title: "Deep scan", icon: "text.magnifyingglass", selected: false) { model.deepScan() }
+                    Chip(title: model.hasAPIKey ? "Claude picks" : "Add Claude", icon: "sparkles", selected: false) {
                         if model.hasAPIKey {
-                            model.analysisJob = Job(title: "Claude is cutting the shorts")
-                            Task { await model.aiPick(); model.analysisJob = nil }
+                            Task { await model.aiFind(); model.analysisJob = nil }
                         } else {
                             onSettings()
                         }
                     }
                     Spacer()
+                    if let m = model.selectedMoment, !m.postText.isEmpty || !m.postTitle.isEmpty {
+                        Button { model.copyPostText(m) } label: {
+                            Image(systemName: "doc.on.doc").font(.system(size: 14, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
+                    }
                 }
             }
 
@@ -197,10 +202,8 @@ struct CaptionsPanel: View {
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Toggle("Captions", isOn: model.bind(\.captionsOn))
-                        .font(.system(size: 14, weight: .semibold)).tint(Theme.accent)
-                }
+                Toggle("Captions", isOn: model.bind(\.captionsOn))
+                    .font(.system(size: 14, weight: .semibold)).tint(Theme.accent)
                 if let job = model.captionJob { JobRow(job: job) }
 
                 if model.style.captionsOn {
@@ -208,13 +211,12 @@ struct CaptionsPanel: View {
                         get: { model.style.script },
                         set: { model.style.script = $0; model.state.style = model.style; model.captionsChanged() }))
 
-                    HStack(spacing: 8) {
-                        ForEach(CaptionStyleKind.allCases) { k in
-                            Chip(title: k.rawValue, selected: model.style.captionStyle == k) {
-                                model.style.captionStyle = k
-                                model.styleChanged()
-                            }
-                        }
+                    Segments(items: CaptionStyleKind.allCases, label: { $0.rawValue }, value: Binding(
+                        get: { model.style.captionStyle },
+                        set: { model.style.captionStyle = $0; model.state.style = model.style; model.captionsChanged() }))
+
+                    HStack(spacing: 10) {
+                        SectionLabel(text: "Spoken word")
                         Spacer()
                         ForEach(0..<CaptionRenderer.palette.count, id: \.self) { i in
                             Circle()
@@ -233,7 +235,7 @@ struct CaptionsPanel: View {
                             let p = model.captionPhrases()
                             if p.isEmpty { model.show("Transcribe the clip first") } else { editing = PhraseList(items: p) }
                         }
-                        Chip(title: "AI Hinglish", icon: "sparkles", selected: false) { model.aiFixCaptions() }
+                        Chip(title: "AI fix", icon: "sparkles", selected: false) { model.aiFixCaptions() }
                     }
 
                     HStack {
@@ -392,8 +394,9 @@ struct FXPanel: View {
                 fx("Punch-in", "Zooms in when the streamer gets loud", \.punch)
                 fx("Retention bar", "Thin progress line along the top", \.progressBar)
                 fx("Hype meter", "Bar that follows the streamer's energy", \.hype)
+                fx("Hook stays on", "Keep the hook box on screen for the whole short", \.hookStays)
                 VStack(alignment: .leading, spacing: 4) {
-                    SectionLabel(text: "Hook · first 2.5 s")
+                    SectionLabel(text: "Hook")
                     HStack(spacing: 8) {
                         TextField("e.g. Ye banda pagal hai 😭", text: model.bind(\.hook))
                             .font(.system(size: 15, weight: .semibold))
