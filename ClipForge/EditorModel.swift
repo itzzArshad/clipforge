@@ -637,8 +637,8 @@ final class EditorModel {
                 moments[i].hook = p.hook
                 moments[i].reason = p.reason
                 moments[i].stage = .ai
-                let w = sourceWords.filter { $0.start >= s && $0.end <= e }
-                moments[i].transcript = w.map { Transliterator.hinglish($0.text) }.joined(separator: " ")
+                let clipWords = sourceWords.filter { $0.start >= s && $0.end <= e }
+                moments[i].transcript = clipWords.map { Transliterator.hinglish($0.text) }.joined(separator: " ")
             }
             source = .best
             if let top = visibleMoments.first { select(top) }
