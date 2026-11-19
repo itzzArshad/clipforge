@@ -371,7 +371,7 @@ def run_job(jid, url, opts):
                 start, end = float(opts["from"]), float(opts["to"])
                 update(jid, note="Grabbing that part of the live stream")
                 ytarchive_range(jid, url, work, start, max(10, end - start), h)
-            elif mode == "last":
+            elif mode == "last" or (mode == "best" and shutil.which("ytarchive")):
                 mins = int(opts.get("live_minutes", 10))
                 update(jid, note=f"Grabbing the last {mins} min")
                 ytarchive_range(jid, url, work, -mins * 60, mins * 60, h)
