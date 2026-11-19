@@ -34,11 +34,23 @@ iPhone with Feather.
 - Transcriber.swift: actor wrapping WhisperKit (word timestamps).
 - Moments.swift: Moment model, TextScorer (excitement lexicon, speech rate, repeats, punctuation),
   ShortShaper (cuts a moment at sentence boundaries: setup before the peak, payoff after).
-- ClaudeRanker.swift: optional Anthropic API (user key in UserDefaults "anthropicKey"): pickShorts (start/end,
-  score, title, hook per moment) and hinglishCaptions (same word count rewrite).
-- Transliterator.swift: Devanagari -> Hinglish (tables + schwa deletion + common-word dictionary).
+- AIBridge.swift + AISheet.swift: the only AI. The app builds a prompt (pick/cut shorts from top moments with speech +
+  chat; or fix caption spelling), the user copies it into any AI chat and pastes the JSON answer back. A Claude API
+  key (UserDefaults "anthropicKey") optionally sends the same prompt. Parsing/guards ported from PeakCut.
+- ChatSignal.swift: chat as the main free highlight signal. Twitch VOD chat replay (GQL persisted query, may break),
+  Twitch live chat (anonymous IRC), Kick live chat (Pusher, best effort), per-second chat curve shifted back ~12 s
+  (chat lags the action), peaks, chat samples. YouTube "most replayed" comes from the helper (yt-dlp heatmap).
+- Transliterator.swift: Devanagari and Urdu script -> Roman Hinglish (port of PeakCut roman.py).
 - Facecam.swift: Vision-based facecam detection + manual box editor. Stream layout = facecam top, gameplay bottom.
 - Overlays.swift: watermark and "peak slam" bitmaps.
+- StreamSources.swift: Twitch (GQL playback token + usher HLS) and Kick (API, with a hidden WKWebView fallback for
+  Cloudflare) VODs and live streams, downloaded ON THE PHONE: pick an H.264 rendition, fetch only the asked-for
+  time range, skip Twitch ad segments, handle "-muted" segments. fMP4 renditions are concatenated as-is.
+- TSRemuxer.swift: MPEG-TS -> MP4 without re-encoding (PAT/PMT/PES demux, H.264 Annex-B -> AVCC, ADTS AAC,
+  AVAssetWriter passthrough with separate video/audio queues so interleaving never deadlocks).
+- LinkImporter.swift: routes links; YouTube only via the optional helper/clipforge_helper.py on a computer (yt-dlp).
+- Ported from PeakCut (MIT, see THIRD_PARTY_NOTICES.md): romanisation, clip/caption prompts, sentence snapping,
+  caption styles (Bounce/Hype/Clean with bundled OFL fonts in ClipForge/Fonts), hook box.
 - Exporter.swift: composition building, video composition, export, save to Photos.
 - GlassKit.swift (Theme, Segments, JobRow), TimelineStrip.swift, Panels.swift, ContentView.swift: UI.
   Design: graphite surfaces, hairlines, one lime accent, mono timecodes. Glass only over video.
@@ -49,6 +61,12 @@ iPhone with Feather.
 - Two timelines: source time (original video) vs composition time (after silences are cut).
   Map with EditorModel.mapWords; transcripts are stored in source time.
 - Core Image uses a bottom-left origin. The renderer is designed at 1080x1920; everything scales by k = width / 1080
-  (preview renders at 540x960).
+  (preview renders at 432x768).
 - Never block the main thread with file copies or AVAssetReader loops.
-- Streams are usually Hindi/Hinglish; Whisper with language "hi" outputs Devanagari.
+- Streams are usually Hindi/Hinglish; Whisper with language "hi" outputs Devanagari and sometimes Urdu script.
+  Captions default to Roman Hinglish via Transliterator.roman.
+- Heat budget (the app used to overheat phones): import runs NO model. Moments come from loudness + chat + replays,
+  cut on pauses (AudioAnalyzer.nearestPause). Whisper only runs when asked (Listen top 5, captions, export, Deep
+  scan), "small" by default, unloaded after jobs and on background, and every heavy step waits in coolDown() while
+  ProcessInfo.thermalState is serious/critical. Preview renders at 432x768, 24 fps, plays once (no loop). Clip
+  loudness is sliced from import bins (AudioAnalyzer.clipBins), never re-decoded. Keep it that way.

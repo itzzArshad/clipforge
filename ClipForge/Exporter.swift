@@ -21,7 +21,7 @@ struct BuiltClip {
 
 enum Exporter {
     static let exportSize = CGSize(width: 1080, height: 1920)
-    static let previewSize = CGSize(width: 540, height: 960)
+    static let previewSize = CGSize(width: 432, height: 768)   // smaller preview = far less GPU work per frame
 
     static func orientation(for t: CGAffineTransform) -> CGImagePropertyOrientation {
         switch (t.a, t.b, t.c, t.d) {
@@ -57,11 +57,11 @@ enum Exporter {
         return BuiltClip(comp: comp, trackID: cv.trackID, keep: keep)
     }
 
-    static func videoComposition(for b: BuiltClip, state: ReelState, size: CGSize) -> AVMutableVideoComposition {
+    static func videoComposition(for b: BuiltClip, state: ReelState, size: CGSize, fps: Int32 = 30) -> AVMutableVideoComposition {
         let vc = AVMutableVideoComposition()
         vc.customVideoCompositorClass = ReelCompositor.self
         vc.renderSize = size
-        vc.frameDuration = CMTime(value: 1, timescale: 30)
+        vc.frameDuration = CMTime(value: 1, timescale: fps)
         vc.instructions = [
             ReelInstruction(timeRange: CMTimeRange(start: .zero, duration: b.comp.duration),
                             trackID: b.trackID, state: state)

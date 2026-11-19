@@ -39,4 +39,10 @@ actor Transcriber {
         }
         return out.sorted { $0.start < $1.start }
     }
+
+    /// Frees the model (a few hundred MB). The next transcription loads it again (fast once it is compiled).
+    func unload() {
+        pipe = nil
+        loadedModel = nil
+    }
 }

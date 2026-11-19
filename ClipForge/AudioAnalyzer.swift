@@ -186,4 +186,33 @@ enum AudioAnalyzer {
         if end > cur { keep.append(cur...end) }
         return keep.isEmpty ? [start...end] : keep
     }
+
+    /// The quietest instant within `within` seconds of `t`: a breath between sentences. Cutting there instead
+    /// of at a fixed time avoids chopping a word in half, without needing a transcript.
+    static func nearestPause(bins: [Float], t: Double, within: Double = 2.5) -> Double {
+        guard !bins.isEmpty else { return t }
+        let a = max(0, Int((t - within) / binSeconds)), b = min(bins.count - 1, Int((t + within) / binSeconds))
+        guard a < b else { return t }
+        var best = a
+        var bestV = Float.greatestFiniteMagnitude
+        for i in a...b {
+            // average of 3 bins so one quiet blip between syllables does not count as a pause
+            let v = (bins[max(a, i - 1)] + bins[i] + bins[min(b, i + 1)]) / 3
+            // small pull towards t so a pause near the asked time wins over an equal one far away
+            let score = v + Float(abs(Double(i) * binSeconds - t)) * 0.8
+            if score < bestV { bestV = score; best = i }
+        }
+        return Double(best) * binSeconds
+    }
+
+    /// Loudness bins of a clip made from `keep` ranges, cut out of the whole video's bins. Same as decoding the
+    /// clip's audio again, without decoding anything.
+    static func clipBins(_ bins: [Float], keep: [ClosedRange<Double>]) -> [Float] {
+        var out: [Float] = []
+        for r in keep {
+            let a = max(0, Int(r.lowerBound / binSeconds)), b = min(bins.count, Int((r.upperBound / binSeconds).rounded(.up)))
+            if a < b { out.append(contentsOf: bins[a..<b]) }
+        }
+        return out
+    }
 }
