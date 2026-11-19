@@ -6,8 +6,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "0.3"
-    CURRENT_PROJECT_VERSION: "3"
+    MARKETING_VERSION: "0.5"
+    CURRENT_PROJECT_VERSION: "5"
 packages:
   ArgmaxOSS:
     url: https://github.com/argmaxinc/argmax-oss-swift
@@ -28,6 +28,13 @@ targets:
         NSPhotoLibraryAddUsageDescription: Save exported clips to your Photos
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # caption fonts from PeakCut (SIL Open Font License, see ClipForge/Fonts/OFL-*.txt)
+        UIAppFonts: [Poppins-ExtraBold.ttf, Anton-Regular.ttf]
+        # stream links are downloaded by the ClipForge helper running on your own computer (plain http on your Wi-Fi)
+        NSLocalNetworkUsageDescription: Downloads stream links through the ClipForge helper on your computer
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
     settings:
       base:
         # Change this to match the App ID / provisioning profile you sign with
