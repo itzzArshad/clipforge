@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import WebKit
 
 /// Downloads Twitch and Kick VODs and live streams on the phone itself: find the stream's HLS playlist,
@@ -156,7 +157,7 @@ enum StreamSources {
     // MARK: HLS
 
     struct Variant { let url: URL; let bandwidth: Int; let height: Int; let codecs: String }
-    struct Segment { let url: URL; let duration: Double; let start: Double }
+    struct Segment { let url: URL; let duration: Double; let start: Double; var discontinuity = false }
     struct Media { var segments: [Segment]; var ended: Bool; var map: URL?; var target: Double }
 
     static func get(_ url: URL, retries: Int = 3) async throws -> Data {
@@ -217,7 +218,7 @@ enum StreamSources {
     /// Twitch marks inserted ads with a title other than "live"; those segments are skipped.
     static func media(_ text: String, base: URL, skipAds: Bool) -> Media {
         var m = Media(segments: [], ended: false, map: nil, target: 6)
-        var dur = 0.0, title = "", t = 0.0
+        var dur = 0.0, title = "", t = 0.0, disc = false
         for raw in text.components(separatedBy: .newlines) {
             let l = raw.trimmingCharacters(in: .whitespaces)
             if l.hasPrefix("#EXTINF:") {
@@ -227,6 +228,8 @@ enum StreamSources {
                 title = comma.map { String(v[v.index(after: $0)...]) } ?? ""
             } else if l.hasPrefix("#EXT-X-TARGETDURATION:") {
                 m.target = Double(l.dropFirst(22)) ?? 6
+            } else if l.hasPrefix("#EXT-X-DISCONTINUITY") && !l.hasPrefix("#EXT-X-DISCONTINUITY-SEQUENCE") {
+                disc = true
             } else if l.hasPrefix("#EXT-X-ENDLIST") {
                 m.ended = true
             } else if l.hasPrefix("#EXT-X-MAP") {
@@ -234,7 +237,10 @@ enum StreamSources {
             } else if !l.isEmpty && !l.hasPrefix("#") {
                 let ad = skipAds && !title.isEmpty && title != "live"
                 if !ad, let u = URL(string: l, relativeTo: base)?.absoluteURL {
-                    m.segments.append(Segment(url: u, duration: dur, start: t))
+                    m.segments.append(Segment(url: u, duration: dur, start: t, discontinuity: disc))
+                    disc = false
+                } else if ad {
+                    disc = true          // the content after an ad break continues on a new timeline
                 }
                 t += dur
                 dur = 0; title = ""
@@ -301,42 +307,63 @@ enum StreamSources {
                 try h.seekToEnd(); try h.write(contentsOf: data)
                 await onStatus(label, Double(n + 1) / Double(segs.count))
             }
-            return Downloaded(file: out, offset: offset)
+            await onStatus("Finishing the video", nil)
+            return Downloaded(file: try await checked(await TSRemuxer.normalize(out)), offset: offset)
         }
 
         let remux = TSRemuxer(output: out)
         do {
             try await fetchInOrder(segs, twitch: src.isTwitch) { n, data in
+                if segs[n].discontinuity && n > 0 { remux.discontinuity() }
                 try remux.append(data)
                 await onStatus(label, Double(n + 1) / Double(segs.count))
             }
             await onStatus("Finishing the video", nil)
-            return Downloaded(file: try await remux.finish(), offset: offset)
+            let raw = try await remux.finish()
+            return Downloaded(file: try await checked(await TSRemuxer.normalize(raw)), offset: offset)
         } catch {
             remux.cancel()
             throw error
         }
     }
 
-    /// Fetches 4 segments at a time but hands them over strictly in order.
-    private static func fetchInOrder(_ segs: [Segment], twitch: Bool,
+    /// Keeps 8 segment downloads running at all times (a new one starts as soon as any finishes) and hands
+    /// them over strictly in order. The old version waited for the slowest of every 4, which was slow on Kick.
+    private static func fetchInOrder(_ segs: [Segment], twitch: Bool, parallel: Int = 8,
                                      handle: (Int, Data) async throws -> Void) async throws {
-        let batch = 4
-        var i = 0
-        while i < segs.count {
-            try Task.checkCancellation()
-            let slice = Array(segs[i..<min(segs.count, i + batch)])
-            let datas: [Data] = try await withThrowingTaskGroup(of: (Int, Data).self) { g in
-                for (k, s) in slice.enumerated() {
-                    g.addTask { (k, try await StreamSources.segment(s, twitch: twitch)) }
-                }
-                var got = [Data?](repeating: nil, count: slice.count)
-                for try await pair in g { got[pair.0] = pair.1 }
-                return got.compactMap { $0 }
+        try await withThrowingTaskGroup(of: (Int, Data).self) { g in
+            var next = 0, emit = 0
+            var ready: [Int: Data] = [:]
+            while next < min(parallel, segs.count) {
+                let k = next, seg = segs[k]
+                g.addTask { (k, try await StreamSources.segment(seg, twitch: twitch)) }
+                next += 1
             }
-            for (k, d) in datas.enumerated() { try await handle(i + k, d) }
-            i += slice.count
+            while let done = try await g.next() {
+                try Task.checkCancellation()
+                ready[done.0] = done.1
+                while let d = ready.removeValue(forKey: emit) {
+                    try await handle(emit, d)
+                    emit += 1
+                }
+                if next < segs.count {
+                    let k = next, seg = segs[k]
+                    g.addTask { (k, try await StreamSources.segment(seg, twitch: twitch)) }
+                    next += 1
+                }
+            }
         }
+    }
+
+    /// The editor can only work with a file AVFoundation can open; say so clearly instead of importing junk.
+    private static func checked(_ url: URL) async throws -> URL {
+        let asset = AVURLAsset(url: url)
+        let d = (try? await asset.load(.duration).seconds) ?? 0
+        let video = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+        guard d > 1, !video.isEmpty else {
+            throw err("The downloaded video couldn't be read. Try a shorter part, or a lower quality.")
+        }
+        return url
     }
 
     private static func recordLive(_ mediaURL: URL, minutes: Int, twitch: Bool, out: URL,
@@ -357,6 +384,7 @@ enum StreamSources {
                 for s in fresh {
                     seen.insert(s.url.absoluteString)
                     guard let d = try? await get(s.url) else { continue }
+                    if s.discontinuity { remux.discontinuity() }
                     try remux.append(d)
                     recorded += s.duration
                     let left = max(0, goal - recorded)
@@ -372,7 +400,8 @@ enum StreamSources {
             if recorded < 10 { remux.cancel(); throw error }
         }
         await onStatus("Finishing the video", nil)
-        return try await remux.finish()
+        let raw = try await remux.finish()
+        return try await checked(await TSRemuxer.normalize(raw))
     }
 }
 

@@ -90,6 +90,45 @@ def explain(err) -> str:
     return s[-400:]
 
 
+def record_live(jid, url, work, minutes):
+    """Records the next `minutes` of a live stream with ffmpeg straight from its HLS playlist.
+
+    yt-dlp hands live streams to ffmpeg, which reports no progress and ignores a time limit, so the old
+    version sat at 0% forever. Here ffmpeg gets the playlist and a fixed length, and progress is the clock.
+    """
+    import yt_dlp
+    h = MAX_HEIGHT
+    fmt = f"best[protocol^=m3u8][height<={h}][vcodec^=avc1]/best[protocol^=m3u8][height<={h}]/best[protocol^=m3u8]/best"
+    with yt_dlp.YoutubeDL(ydl_opts({"format": fmt})) as ydl:
+        info = ydl.extract_info(url, download=False)
+    src_url = info.get("url")
+    if not src_url:
+        raise RuntimeError("Couldn't find the live stream's video address.")
+    secs = max(60, minutes * 60)
+    headers = "".join(f"{k}: {v}\r\n" for k, v in (info.get("http_headers") or {}).items())
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    if headers:
+        cmd += ["-headers", headers]
+    cmd += ["-i", src_url, "-t", str(secs), "-c", "copy", "-f", "mpegts", str(work / "src.ts")]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    started = time.time()
+    while proc.poll() is None:
+        with lock:
+            gone = jid not in jobs
+        if gone:
+            proc.terminate()
+            return
+        update(jid, progress=round(min(0.99, (time.time() - started) / secs), 3))
+        if time.time() - started > secs + 90:       # a stuck stream: stop and keep what was recorded
+            proc.terminate()
+            break
+        time.sleep(1)
+    err = proc.stderr.read() if proc.stderr else ""
+    out = work / "src.ts"
+    if not out.exists() or out.stat().st_size < 100_000:
+        raise RuntimeError("Recording the live stream failed: " + (err or "nothing was recorded")[-300:])
+
+
 def run_job(jid, url, live_minutes):
     import yt_dlp
     work = DATA / jid
@@ -104,34 +143,22 @@ def run_job(jid, url, live_minutes):
                duration=float(info.get("duration") or 0), live=is_live, state="downloading",
                heatmap=info.get("heatmap") or [])   # YouTube "most replayed" graph, when YouTube has one
 
-        started = time.time()
-
-        def hook(d):
-            if d.get("status") == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                if is_live:
-                    p = min(0.99, (time.time() - started) / max(60, live_minutes * 60))
-                    if time.time() - started >= live_minutes * 60:
-                        raise Stop()
-                else:
-                    p = (d.get("downloaded_bytes", 0) / total) if total else 0
-                update(jid, progress=round(p, 3))
-
         h = MAX_HEIGHT
-        fmt = (f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={h}][vcodec^=avc1]+ba/"
-               f"b[height<={h}][vcodec^=avc1]/bv*[height<={h}]+ba/b[height<={h}]/b")
-        opts = ydl_opts({"format": fmt, "outtmpl": str(work / "src.%(ext)s"), "progress_hooks": [hook],
-                         "merge_output_format": "mp4"})
         if is_live:
-            # record from now for the chosen minutes; MPEG-TS so a stopped recording is still a valid file
-            opts.update({"hls_use_mpegts": True, "outtmpl": str(work / "src.ts")})
-        try:
+            record_live(jid, url, work, live_minutes)
+        else:
+            def hook(d):
+                if d.get("status") == "downloading":
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    p = (d.get("downloaded_bytes", 0) / total) if total else 0
+                    update(jid, progress=round(min(p, 0.99), 3))
+
+            fmt = (f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={h}][vcodec^=avc1]+ba/"
+                   f"b[height<={h}][vcodec^=avc1]/bv*[height<={h}]+ba/b[height<={h}]/b")
+            opts = ydl_opts({"format": fmt, "outtmpl": str(work / "src.%(ext)s"), "progress_hooks": [hook],
+                             "merge_output_format": "mp4"})
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
-        except Exception as e:  # noqa: BLE001 - Stop() arrives wrapped in yt-dlp's own error
-            stopped = isinstance(e, Stop) or "Stop" in repr(e) or isinstance(getattr(e, "exc_info", [None, None])[1], Stop)
-            if not (is_live and stopped):
-                raise
         src = max((p for p in work.glob("src*") if p.suffix not in (".part", ".ytdl")),
                   key=lambda p: p.stat().st_size, default=None)
         if src is None:

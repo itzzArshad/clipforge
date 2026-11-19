@@ -24,18 +24,20 @@ final class TSRemuxer {
     private var pmtPID: Int?
     private var videoPID: Int?
     private var audioPID: Int?
-    private var pes: [Int: Data] = [:]
-    private var leftover = Data()
+    private var pes: [Int: [UInt8]] = [:]
+    private var leftover: [UInt8] = []
 
     // formats + timing
     private var sps: Data?
     private var pps: Data?
+    private var formatDirty = false
     private var vFormat: CMVideoFormatDescription?
     private var aFormat: CMAudioFormatDescription?
     private var aSampleRate: Double = 48000
     private var basePTS: Int64?
-    private var lastRaw: [Int: Int64] = [:]
-    private var unwrapped: [Int: Int64] = [:]
+    private var clocks: [Int: StreamClock] = [:]
+    private var lastVideoDTS: Int64 = .min
+    private var lastAudioPTS: Int64 = .min
     private var sawKeyframe = false
     private var pending: [CMSampleBuffer] = []     // samples seen before both formats were known
     private(set) var writtenSeconds: Double = 0
@@ -47,24 +49,30 @@ final class TSRemuxer {
 
     // MARK: feeding
 
-    /// Feed one whole segment (or any chunk of TS bytes).
+    /// Feed one whole segment (or any chunk of TS bytes). Parses straight out of one byte array, without
+    /// allocating per 188-byte packet (the old way was slow on long downloads).
     func append(_ chunk: Data) throws {
-        var data = leftover
-        data.append(chunk)
-        leftover = Data()
-        var i = data.startIndex
-        // resync on the 0x47 sync byte
-        while i < data.endIndex && data[i] != 0x47 { i += 1 }
-        while i + 188 <= data.endIndex {
-            if data[i] != 0x47 {
+        var b = leftover
+        b.append(contentsOf: chunk)
+        leftover = []
+        let n = b.count
+        var i = 0
+        while i < n && b[i] != 0x47 { i += 1 }
+        while i + 188 <= n {
+            if b[i] != 0x47 {
                 i += 1
-                while i < data.endIndex && data[i] != 0x47 { i += 1 }
+                while i < n && b[i] != 0x47 { i += 1 }
                 continue
             }
-            try packet(data[i..<(i + 188)])
+            try packet(b, i)
             i += 188
         }
-        if i < data.endIndex { leftover = Data(data[i..<data.endIndex]) }
+        if i < n { leftover = Array(b[i..<n]) }
+    }
+
+    /// The next segment starts a new timeline (#EXT-X-DISCONTINUITY in the playlist: the stream restarted).
+    func discontinuity() {
+        for k in clocks.keys { clocks[k]?.rebase = true }
     }
 
     /// Call after the last segment. Writes out what is buffered and closes the file.
@@ -94,30 +102,50 @@ final class TSRemuxer {
         try? FileManager.default.removeItem(at: output)
     }
 
+    /// Rewrites a finished file once more without re-encoding (fast, just copying), so the editor gets a clean,
+    /// fully indexed MP4 that starts at 0. Fixes stutter and seeking problems in stitched stream files.
+    static func normalize(_ url: URL) async -> URL {
+        let asset = AVURLAsset(url: url)
+        guard let s = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else { return url }
+        let out = url.deletingLastPathComponent()
+            .appendingPathComponent(url.deletingPathExtension().lastPathComponent + "-clean.mp4")
+        try? FileManager.default.removeItem(at: out)
+        s.outputURL = out
+        s.outputFileType = .mp4
+        s.shouldOptimizeForNetworkUse = true
+        await s.export()
+        guard s.status == .completed else { try? FileManager.default.removeItem(at: out); return url }
+        try? FileManager.default.removeItem(at: url)
+        return out
+    }
+
     // MARK: transport stream
 
-    private func packet(_ p: Data) throws {
-        let b = [UInt8](p)
-        let pusi = (b[1] & 0x40) != 0
-        let pid = (Int(b[1] & 0x1F) << 8) | Int(b[2])
-        let afc = (b[3] >> 4) & 0x3
-        var off = 4
-        if afc == 2 || afc == 3 { off += 1 + Int(b[4]) }
-        guard afc == 1 || afc == 3, off < 188 else { return }
-        let payload = Data(b[off..<188])
+    private func packet(_ b: [UInt8], _ o: Int) throws {
+        let pusi = (b[o + 1] & 0x40) != 0
+        let pid = (Int(b[o + 1] & 0x1F) << 8) | Int(b[o + 2])
+        let afc = (b[o + 3] >> 4) & 0x3
+        var off = o + 4
+        if afc == 2 || afc == 3 { off += 1 + Int(b[o + 4]) }
+        let end = o + 188
+        guard afc == 1 || afc == 3, off < end else { return }
 
         if pid == 0 {
-            parsePAT(payload, pusi: pusi)
+            parsePAT(Array(b[off..<end]), pusi: pusi)
         } else if pid == pmtPID {
-            parsePMT(payload, pusi: pusi)
+            parsePMT(Array(b[off..<end]), pusi: pusi)
         } else if pid == videoPID || pid == audioPID {
-            if pusi { try flushPES(pid); pes[pid] = Data() }
-            pes[pid]?.append(payload)
+            if pusi {
+                try flushPES(pid)
+                var fresh: [UInt8] = []
+                fresh.reserveCapacity(pid == videoPID ? 1 << 16 : 1 << 12)
+                pes[pid] = fresh
+            }
+            pes[pid]?.append(contentsOf: b[off..<end])
         }
     }
 
-    private func section(_ payload: Data, pusi: Bool) -> [UInt8]? {
-        let b = [UInt8](payload)
+    private func section(_ b: [UInt8], pusi: Bool) -> [UInt8]? {
         guard pusi, !b.isEmpty else { return nil }
         let start = 1 + Int(b[0])
         guard start + 3 <= b.count else { return nil }
@@ -126,7 +154,7 @@ final class TSRemuxer {
         return Array(b[start..<(start + 3 + len)])
     }
 
-    private func parsePAT(_ payload: Data, pusi: Bool) {
+    private func parsePAT(_ payload: [UInt8], pusi: Bool) {
         guard let s = section(payload, pusi: pusi), s.count >= 12 else { return }
         var i = 8
         while i + 4 <= s.count - 4 {
@@ -137,7 +165,7 @@ final class TSRemuxer {
         }
     }
 
-    private func parsePMT(_ payload: Data, pusi: Bool) {
+    private func parsePMT(_ payload: [UInt8], pusi: Bool) {
         guard let s = section(payload, pusi: pusi), s.count >= 16 else { return }
         let infoLen = (Int(s[10] & 0x0F) << 8) | Int(s[11])
         var i = 12 + infoLen
@@ -152,9 +180,8 @@ final class TSRemuxer {
     }
 
     private func flushPES(_ pid: Int) throws {
-        guard let d = pes[pid], d.count > 9 else { pes[pid] = nil; return }
+        guard let b = pes[pid], b.count > 9 else { pes[pid] = nil; return }
         pes[pid] = nil
-        let b = [UInt8](d)
         guard b[0] == 0, b[1] == 0, b[2] == 1 else { return }
         let flags = b[7]
         let hlen = Int(b[8])
@@ -163,10 +190,17 @@ final class TSRemuxer {
         if flags & 0x80 != 0 { pts = timestamp(b, 9) }
         if flags & 0x40 != 0 { dts = timestamp(b, 14) }
         guard let rawPTS = pts else { return }
-        let body = Data(b[(9 + hlen)...])
-        let p = unwrap(pid, rawPTS)
-        let dt = dts.map { unwrap(pid + 10_000, $0) } ?? p
-        if pid == videoPID { try video(body, pts: p, dts: dt) } else { try audio(body, pts: p) }
+        let body = Array(b[(9 + hlen)...])
+        if pid == videoPID {
+            let rawDTS = dts ?? rawPTS
+            let wrap: Int64 = 1 << 33
+            var lead = rawPTS - rawDTS                       // B-frame reordering delay
+            if lead < -wrap / 2 { lead += wrap } else if lead > wrap / 2 { lead -= wrap }
+            let d = continuous(pid, rawDTS, step: 3000)
+            try video(body, pts: d + max(0, lead), dts: d)
+        } else {
+            try audio(body, pts: continuous(pid, rawPTS, step: 1920))
+        }
     }
 
     private func timestamp(_ b: [UInt8], _ i: Int) -> Int64 {
@@ -177,18 +211,35 @@ final class TSRemuxer {
         return a | c | d
     }
 
-    /// 33-bit 90 kHz clock that wraps every ~26 hours; keep it increasing.
-    private func unwrap(_ key: Int, _ raw: Int64) -> Int64 {
+    private struct StreamClock {
+        var lastRaw: Int64
+        var lastOut: Int64
+        var step: Int64
+        var rebase = false
+    }
+
+    /// One continuous 90 kHz timeline per stream. Handles the 33-bit wrap, and stream restarts where the clock
+    /// jumps back or far ahead (VODs of a stream that reconnected): those continue right after the last frame,
+    /// instead of producing timestamps the MP4 writer refuses, which used to break the file at that point.
+    private func continuous(_ pid: Int, _ raw: Int64, step: Int64) -> Int64 {
         let wrap: Int64 = 1 << 33
-        guard let last = lastRaw[key], let u = unwrapped[key] else {
-            lastRaw[key] = raw; unwrapped[key] = raw; return raw
+        guard var c = clocks[pid] else {
+            clocks[pid] = StreamClock(lastRaw: raw, lastOut: raw, step: step)
+            return raw
         }
-        var delta = raw - last
-        if delta < -wrap / 2 { delta += wrap }
-        if delta > wrap / 2 { delta -= wrap }
-        lastRaw[key] = raw
-        unwrapped[key] = u + delta
-        return u + delta
+        var delta = raw - c.lastRaw
+        if delta < -wrap / 2 { delta += wrap } else if delta > wrap / 2 { delta -= wrap }
+        var out = c.lastOut + delta
+        if c.rebase || delta < -45_000 || delta > 450_000 {
+            out = c.lastOut + c.step
+        } else if delta > 0 {
+            c.step = min(delta, 90_000)
+        }
+        c.rebase = false
+        c.lastRaw = raw
+        c.lastOut = out
+        clocks[pid] = c
+        return out
     }
 
     private func cm(_ t: Int64) -> CMTime {
@@ -197,8 +248,7 @@ final class TSRemuxer {
 
     // MARK: H.264
 
-    private func nalUnits(_ d: Data) -> [Data] {
-        let b = [UInt8](d)
+    private func nalUnits(_ b: [UInt8]) -> [Data] {
         var starts: [(Int, Int)] = []      // (start of NAL, length of start code)
         var i = 0
         while i + 3 <= b.count {
@@ -216,14 +266,14 @@ final class TSRemuxer {
         return out
     }
 
-    private func video(_ body: Data, pts: Int64, dts: Int64) throws {
+    private func video(_ body: [UInt8], pts: Int64, dts: Int64) throws {
         var frame = Data()
         var key = false
         for nal in nalUnits(body) {
             let type = nal[nal.startIndex] & 0x1F
             switch type {
-            case 7: if sps == nil { sps = nal }
-            case 8: if pps == nil { pps = nal }
+            case 7: if nal != sps { sps = nal; formatDirty = true }
+            case 8: if nal != pps { pps = nal; formatDirty = true }
             case 9: continue                     // access unit delimiter
             case 5: key = true
             default: break
@@ -232,12 +282,16 @@ final class TSRemuxer {
             frame.append(Data(bytes: &len, count: 4))
             frame.append(nal)
         }
-        if vFormat == nil, let sps, let pps {
-            vFormat = try makeVideoFormat(sps: sps, pps: pps)
+        if formatDirty, let sps, let pps {
+            // a restarted stream can come back with new settings; later frames get the new description
+            if let f = try? makeVideoFormat(sps: sps, pps: pps) { vFormat = f }
+            formatDirty = false
         }
         guard let vFormat, !frame.isEmpty else { return }
         if !sawKeyframe { guard key else { return }; sawKeyframe = true }
         if basePTS == nil { basePTS = min(dts, pts) }
+        if dts <= lastVideoDTS { return }          // repeated frame around a restart
+        lastVideoDTS = dts
 
         let buf = try sampleBuffer(frame, format: vFormat, pts: cm(pts), dts: cm(dts))
         if !key, let att = CMSampleBufferGetSampleAttachmentsArray(buf, createIfNecessary: true), CFArrayGetCount(att) > 0 {
@@ -290,8 +344,7 @@ final class TSRemuxer {
 
     private static let rates: [Double] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350]
 
-    private func audio(_ body: Data, pts: Int64) throws {
-        let b = [UInt8](body)
+    private func audio(_ b: [UInt8], pts: Int64) throws {
         var i = 0, n = 0
         while i + 7 <= b.count {
             guard b[i] == 0xFF, (b[i + 1] & 0xF0) == 0xF0 else { i += 1; continue }
@@ -306,10 +359,11 @@ final class TSRemuxer {
                 aSampleRate = Self.rates[srIndex]
                 aFormat = try makeAudioFormat(objectType: profile + 1, srIndex: srIndex, channels: max(1, channels))
             }
-            if let aFormat, sawKeyframe, basePTS != nil {
+            let t = pts + Int64(Double(n * 1024) / aSampleRate * 90000)
+            if let aFormat, sawKeyframe, basePTS != nil, t > lastAudioPTS {
+                lastAudioPTS = t
                 let frame = Data(b[(i + header)..<(i + frameLen)])
-                let offset = Int64(Double(n * 1024) / aSampleRate * 90000)
-                let buf = try audioBuffer(frame, format: aFormat, pts: cm(pts + offset))
+                let buf = try audioBuffer(frame, format: aFormat, pts: cm(t))
                 try write(buf, video: false)
             }
             n += 1
@@ -392,12 +446,16 @@ final class TSRemuxer {
             var progressed = false
             if let v = vInput, !vQueue.isEmpty, v.isReadyForMoreMediaData {
                 let b = vQueue.removeFirst()
-                if CMSampleBufferGetPresentationTimeStamp(b).seconds >= 0 { v.append(b) }
+                if CMSampleBufferGetPresentationTimeStamp(b).seconds >= 0, !v.append(b), writer?.status == .failed {
+                    throw RemuxError.writer(writer?.error?.localizedDescription ?? "a video frame was refused")
+                }
                 progressed = true
             }
             if let a = aInput, !aQueue.isEmpty, a.isReadyForMoreMediaData {
                 let b = aQueue.removeFirst()
-                if CMSampleBufferGetPresentationTimeStamp(b).seconds >= 0 { a.append(b) }
+                if CMSampleBufferGetPresentationTimeStamp(b).seconds >= 0, !a.append(b), writer?.status == .failed {
+                    throw RemuxError.writer(writer?.error?.localizedDescription ?? "an audio frame was refused")
+                }
                 progressed = true
             }
             if progressed { spins = 0; continue }
