@@ -34,8 +34,12 @@ iPhone with Feather.
 - Transcriber.swift: actor wrapping WhisperKit (word timestamps).
 - Moments.swift: Moment model, TextScorer (excitement lexicon, speech rate, repeats, punctuation),
   ShortShaper (cuts a moment at sentence boundaries: setup before the peak, payoff after).
-- ClaudeRanker.swift: optional Anthropic API (user key in UserDefaults "anthropicKey"): findClips (whole transcript in
-  15-min windows, LOUD marks; returns snapped clips with hook, title, post text, punch words) and fixCaptions.
+- AIBridge.swift + AISheet.swift: the only AI. The app builds a prompt (pick/cut shorts from top moments with speech +
+  chat; or fix caption spelling), the user copies it into any AI chat and pastes the JSON answer back. A Claude API
+  key (UserDefaults "anthropicKey") optionally sends the same prompt. Parsing/guards ported from PeakCut.
+- ChatSignal.swift: chat as the main free highlight signal. Twitch VOD chat replay (GQL persisted query, may break),
+  Twitch live chat (anonymous IRC), Kick live chat (Pusher, best effort), per-second chat curve shifted back ~12 s
+  (chat lags the action), peaks, chat samples. YouTube "most replayed" comes from the helper (yt-dlp heatmap).
 - Transliterator.swift: Devanagari and Urdu script -> Roman Hinglish (port of PeakCut roman.py).
 - Facecam.swift: Vision-based facecam detection + manual box editor. Stream layout = facecam top, gameplay bottom.
 - Overlays.swift: watermark and "peak slam" bitmaps.
@@ -61,5 +65,8 @@ iPhone with Feather.
 - Never block the main thread with file copies or AVAssetReader loops.
 - Streams are usually Hindi/Hinglish; Whisper with language "hi" outputs Devanagari and sometimes Urdu script.
   Captions default to Roman Hinglish via Transliterator.roman.
-- Analysis: quick pass (12 loudest stretches) runs after import; "Deep scan" transcribes everything and lets
-  Claude read the whole transcript in 15-minute windows (PeakCut's approach).
+- Heat budget (the app used to overheat phones): import runs NO model. Moments come from loudness + chat + replays,
+  cut on pauses (AudioAnalyzer.nearestPause). Whisper only runs when asked (Listen top 5, captions, export, Deep
+  scan), "small" by default, unloaded after jobs and on background, and every heavy step waits in coolDown() while
+  ProcessInfo.thermalState is serious/critical. Preview renders at 432x768, 24 fps, plays once (no loop). Clip
+  loudness is sliced from import bins (AudioAnalyzer.clipBins), never re-decoded. Keep it that way.

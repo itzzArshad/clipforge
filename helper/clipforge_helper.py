@@ -101,7 +101,8 @@ def run_job(jid, url, live_minutes):
             raise RuntimeError("That is a channel or playlist link. Open one video (or the live stream) and copy its link.")
         is_live = bool(info.get("is_live"))
         update(jid, title=info.get("title") or "", uploader=info.get("uploader") or info.get("channel") or "",
-               duration=float(info.get("duration") or 0), live=is_live, state="downloading")
+               duration=float(info.get("duration") or 0), live=is_live, state="downloading",
+               heatmap=info.get("heatmap") or [])   # YouTube "most replayed" graph, when YouTube has one
 
         started = time.time()
 

@@ -62,6 +62,18 @@ struct EditablePhrase: Identifiable, Equatable {
     var text: String
 }
 
+/// A prompt waiting for the user to run in any AI chat and paste the answer back.
+struct AIRequest: Identifiable {
+    enum Kind { case moments, captions }
+    let id = UUID()
+    let kind: Kind
+    let prompt: String
+    var windows: [Int: ClosedRange<Double>] = [:]   // moments: candidate number -> window it may cut in
+    var momentIDs: [Int: UUID] = [:]
+    var wordIndices: [Int] = []                     // captions: which sourceWords the answer replaces
+    var originals: [String] = []
+}
+
 /// Asks iOS for a little extra time if the user leaves the app mid-download.
 @MainActor
 final class BackgroundTime {
@@ -102,7 +114,7 @@ final class EditorModel {
     // style + captions
     var style = ReelStyle()
     var language = "hi"
-    var accurateModel = true
+    var accurateModel = false         // the big model is the main source of heat; it is opt-in now
     var sourceWords: [RawWord] = []
     var covered: [ClosedRange<Double>] = []
     var logo: UIImage?
@@ -117,6 +129,15 @@ final class EditorModel {
 
     // facecam editor
     var facecamFrame: UIImage?
+
+    // free signals from the platform (no AI): chat, YouTube "most replayed"
+    var chat: [ChatMessage] = []
+    var chatCurve: [Float] = []
+    var replays: [Float] = []
+
+    // copy-paste AI
+    var aiRequest: AIRequest?
+    var hot = false                    // the phone is too warm: heavy work waits
 
     // playback
     var toast: String?
@@ -136,7 +157,7 @@ final class EditorModel {
 
     init() {
         loadPrefs()
-        player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.05, preferredTimescale: 600),
+        player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
                                        queue: .main) { [weak self] t in
             Task { @MainActor in self?.playhead = t.seconds }
         }
@@ -241,7 +262,7 @@ final class EditorModel {
                 let r = try await LinkImporter.fetch(link, options: options) { [weak self] t, p in
                     self?.importJob = Job(title: t, progress: p)
                 }
-                await importVideo(r.file, title: r.title, channel: r.channel)
+                await importVideo(r.file, title: r.title, channel: r.channel, chat: r.chat, replays: r.heat)
             } catch {
                 importJob = nil
                 show(error.localizedDescription)
@@ -249,7 +270,8 @@ final class EditorModel {
         }
     }
 
-    func importVideo(_ url: URL, title: String = "", channel: String = "") async {
+    func importVideo(_ url: URL, title: String = "", channel: String = "",
+                     chat: [ChatMessage] = [], replays: [Float] = []) async {
         analysisTask?.cancel()
         analysisTask = nil
         analysisJob = nil
@@ -272,14 +294,12 @@ final class EditorModel {
             picked = []
             style.facecam = nil
             if style.layout == .stream { style.layout = .fit }
+            self.chat = chat
+            chatCurve = ChatSignal.curve(chat, duration: duration)
+            self.replays = replays.count > 10 ? replays : []
 
-            let hs = AudioAnalyzer.highlights(bins: bins, windowSeconds: 30, count: 14)
-            let top = max(hs.map(\.score).max() ?? 1, 1)
-            moments = hs.map { h in
-                let peak = peakTime(in: h.start...h.end)
-                return Moment(start: max(0, peak - 15), end: min(duration, peak + 15), peak: peak, loud: h.score / top)
-            }
-            source = .loud
+            moments = findMoments()
+            source = .best
             if let first = visibleMoments.first {
                 select(first)
             } else {
@@ -287,10 +307,51 @@ final class EditorModel {
             }
             await rebuildPreview()
             detectFacecam()
-            analyzeSpeech()
+            var found = "\(moments.count) moments"
+            if !chatCurve.isEmpty { found += " · chat \(chat.count) msgs" }
+            if !self.replays.isEmpty { found += " · most-replayed" }
+            show(found)
         } catch {
             show("Import failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Moments from free signals only (no AI, no transcription): loud audio, chat spikes, YouTube replays.
+    /// Each is cut with a few seconds of setup before the peak and ends on a pause in the talking.
+    private func findMoments() -> [Moment] {
+        var cands: [(peak: Double, from: String)] = []
+        let hs = AudioAnalyzer.highlights(bins: bins, windowSeconds: 30, count: 14)
+        for h in hs { cands.append((peakTime(in: h.start...h.end), "loud")) }
+        for p in ChatSignal.peaks(chatCurve, count: 15) { cands.append((Double(p.0), "chat")) }
+        for p in ChatSignal.peaks(replays, floor: 0.5, gap: 45, count: 8) { cands.append((Double(p.0) + 3, "replay")) }
+
+        var out: [Moment] = []
+        for c in cands {
+            // one moment per stretch of video: a chat spike next to a loud peak is the same moment
+            if let i = out.firstIndex(where: { abs($0.peak - c.peak) < 20 }) {
+                if c.from == "chat" { out[i].peak = (out[i].peak + c.peak) / 2 }
+                continue
+            }
+            let peak = min(max(0, c.peak), duration)
+            let s = AudioAnalyzer.nearestPause(bins: bins, t: max(0, peak - 18))
+            let e = AudioAnalyzer.nearestPause(bins: bins, t: min(duration, peak + 10))
+            var m = Moment(start: s, end: max(e, min(duration, s + 12)), peak: peak, loud: loudScore(s...e))
+            if !chatCurve.isEmpty {
+                m.chat = curveScore(chatCurve, around: peak)
+                m.chatSample = ChatSignal.sample(chat, around: peak, limit: 12)
+            }
+            if !replays.isEmpty { m.heat = curveScore(replays, around: peak) }
+            m.title = c.from == "chat" ? "Chat went off" : (c.from == "replay" ? "Most replayed" : "Loud moment")
+            out.append(m)
+        }
+        return out
+    }
+
+    private func curveScore(_ c: [Float], around t: Double) -> Float {
+        guard !c.isEmpty else { return 0 }
+        let a = max(0, Int(t) - 8), b = min(c.count - 1, Int(t) + 8)
+        guard a <= b else { return 0 }
+        return c[a...b].max() ?? 0
     }
 
     private func peakTime(in r: ClosedRange<Double>) -> Double {
@@ -375,8 +436,8 @@ final class EditorModel {
         guard let url = videoURL else { throw ExportError.noVideo }
         let keep = removeSilence ? AudioAnalyzer.keepRanges(bins: bins, start: s, end: e) : [s...e]
         let b = try await Exporter.build(url: url, keep: keep)
-        let samples = try await AudioAnalyzer.samples(asset: b.comp)
-        let levels = AudioAnalyzer.levels(bins: AudioAnalyzer.bins(fromSamples: samples))
+        // the clip's loudness comes from the bins already measured at import, not from decoding audio again
+        let levels = AudioAnalyzer.levels(bins: AudioAnalyzer.clipBins(bins, keep: keep))
 
         let st = ReelState(orientation: orientation)
         var sty = style
@@ -412,13 +473,14 @@ final class EditorModel {
             state = st
             clipDuration = b.comp.duration.seconds
             let item = AVPlayerItem(asset: b.comp)
-            item.videoComposition = Exporter.videoComposition(for: b, state: st, size: Exporter.previewSize)
+            item.videoComposition = Exporter.videoComposition(for: b, state: st, size: Exporter.previewSize, fps: 24)
+            // plays once, then stops (a preview looping forever kept the GPU busy and the phone warm)
             if let o = loopObserver { NotificationCenter.default.removeObserver(o) }
             loopObserver = NotificationCenter.default.addObserver(
                 forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
                 Task { @MainActor in
+                    self?.isPlaying = false
                     self?.player.seek(to: .zero)
-                    self?.player.play()
                 }
             }
             player.replaceCurrentItem(with: item)
@@ -432,6 +494,27 @@ final class EditorModel {
     func togglePlay() {
         if isPlaying { player.pause() } else { player.play() }
         isPlaying.toggle()
+    }
+
+    /// App went to the background: stop playback and free the speech model (hundreds of MB).
+    func pauseForBackground() {
+        player.pause()
+        isPlaying = false
+        if analysisJob == nil && captionJob == nil && exportJob == nil {
+            Task { await transcriber.unload() }
+        }
+    }
+
+    /// Waits while the phone is hot. Heavy steps call this first, so the phone gets a chance to cool down
+    /// instead of throttling (which makes everything slower and hotter).
+    func coolDown(_ update: (String) -> Void) async {
+        while !Task.isCancelled {
+            let t = ProcessInfo.processInfo.thermalState
+            hot = t == .serious || t == .critical
+            if !hot { return }
+            update("Phone is hot · paused to cool down")
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+        }
     }
 
     func styleChanged() {
@@ -460,6 +543,11 @@ final class EditorModel {
 
     private func transcribe(_ r: ClosedRange<Double>) async throws -> [RawWord] {
         guard let url = videoURL else { return [] }
+        await coolDown { [weak self] msg in
+            self?.analysisJob?.detail = msg
+            self?.captionJob?.detail = msg
+            self?.exportJob?.detail = msg
+        }
         let samples = try await AudioAnalyzer.samples(asset: AVURLAsset(url: url), range: r)
         let raw = try await transcriber.words(samples: samples, model: modelName, language: language, offset: r.lowerBound)
         // keep words the user already fixed by hand
@@ -501,39 +589,35 @@ final class EditorModel {
         scheduleRebuild()
     }
 
-    /// Claude tidies the clip's caption words: Hinglish spelling, digits, names, punctuation. Same word count and
-    /// timing; anything that looks like a translation instead of a spelling is refused (PeakCut's rules).
+    /// Caption spelling fix (Hinglish, digits, names) by any AI: makes the prompt; the answer comes back
+    /// through `applyAI`. Same word count and timing; translations are refused (PeakCut's rules).
     func aiFixCaptions() {
-        let key = UserDefaults.standard.string(forKey: "anthropicKey") ?? ""
-        guard !key.isEmpty else { show("Add your Claude API key in Settings"); return }
-        guard captionJob == nil else { return }
         let idx = sourceWords.indices.filter { sourceWords[$0].end > start && sourceWords[$0].start < end }
-        guard !idx.isEmpty else { show("Transcribe the clip first"); return }
-        captionJob = Job(title: "Claude is fixing the captions")
-        let title = videoTitle
-        Task {
-            defer { captionJob = nil }
-            do {
-                let originals = idx.map { sourceWords[$0].text }
-                let fixed = try await ClaudeRanker.fixCaptions(originals, apiKey: key, title: title)
-                guard fixed.count == idx.count else { return }
-                // apply back to front so removals do not shift the indices still to come
-                for (n, i) in idx.enumerated().reversed() where i < sourceWords.count {
-                    let t = fixed[n].trimmingCharacters(in: .whitespaces)
-                    if t.isEmpty {
-                        if n > 0 { sourceWords[idx[n - 1]].end = sourceWords[i].end }
-                        sourceWords.remove(at: i)
-                    } else {
-                        sourceWords[i].text = t
-                        sourceWords[i].fixed = true
-                    }
-                }
-                scheduleRebuild()
-                show("Captions fixed")
-            } catch {
-                show("Claude failed: \(error.localizedDescription)")
+        guard idx.count >= 3 else { show("Transcribe the clip first"); return }
+        let originals = idx.map { sourceWords[$0].text }
+        aiRequest = AIRequest(kind: .captions, prompt: AIBridge.captionsPrompt(originals, title: videoTitle),
+                              wordIndices: idx, originals: originals)
+    }
+
+    private func applyCaptionAnswer(_ reply: String, _ req: AIRequest) -> String? {
+        guard let fixed = AIBridge.parseCaptions(reply, original: req.originals) else {
+            return "That answer doesn't have exactly \(req.originals.count) words in a JSON list. Copy the whole answer, or ask the AI again."
+        }
+        // apply back to front so removals do not shift the indices still to come
+        for (n, i) in req.wordIndices.enumerated().reversed() where i < sourceWords.count {
+            guard sourceWords[i].text == req.originals[n] else { continue }   // changed since: leave it
+            let t = fixed[n].trimmingCharacters(in: .whitespaces)
+            if t.isEmpty {
+                if n > 0, req.wordIndices[n - 1] < sourceWords.count { sourceWords[req.wordIndices[n - 1]].end = sourceWords[i].end }
+                sourceWords.remove(at: i)
+            } else {
+                sourceWords[i].text = t
+                sourceWords[i].fixed = true
             }
         }
+        scheduleRebuild()
+        show("Captions fixed")
+        return nil
     }
 
     func captionPhrases() -> [EditablePhrase] {
@@ -601,25 +685,29 @@ final class EditorModel {
         styleChanged()
     }
 
-    // MARK: moment finding (background)
+    // MARK: moment finding (background, opt-in)
 
-    /// Quick pass: transcribe the 12 loudest stretches, cut each at sentence boundaries, then let Claude
-    /// (if there is a key) pick and cut clips from everything transcribed so far.
-    func analyzeSpeech() {
+    /// Transcribes only the top few moments (about a minute each) so they can be cut at real sentence ends and
+    /// judged by what was said. Uses the light model unless "Accurate" is on.
+    func listenTop(_ n: Int = 5) {
         guard videoURL != nil, analysisTask == nil else { return }
+        let ids = visibleMoments.filter { $0.stage == .loud }.prefix(n).map(\.id)
+        guard !ids.isEmpty else { show("The top moments are already transcribed"); return }
         analysisTask = Task { [weak self] in
-            await self?.runAnalysis()
+            await self?.runListen(ids)
+            await self?.transcriber.unload()
             self?.analysisTask = nil
             self?.analysisJob = nil
         }
     }
 
-    /// Deep scan (how PeakCut works): transcribe the whole video, then Claude reads all of it in 15-minute
-    /// windows. Finds story moments that are not loud. Slow on a long stream, so it is a separate button.
+    /// Deep scan: transcribes the whole video, then scores every stretch by what was said. Heavy: on a long
+    /// stream this keeps the phone busy (and warm) for a long time. Pauses itself when the phone gets hot.
     func deepScan() {
         guard videoURL != nil, analysisTask == nil else { return }
         analysisTask = Task { [weak self] in
             await self?.runDeepScan()
+            await self?.transcriber.unload()
             self?.analysisTask = nil
             self?.analysisJob = nil
         }
@@ -629,19 +717,21 @@ final class EditorModel {
         analysisTask?.cancel()
         analysisTask = nil
         analysisJob = nil
+        for i in moments.indices where moments[i].stage == .listening { moments[i].stage = .loud }
     }
 
-    private func runAnalysis() async {
-        let targets = moments.sorted { $0.loud > $1.loud }.prefix(12).map(\.id)
-        let total = Double(targets.count + (hasAPIKey ? 1 : 0))
-        for (n, id) in targets.enumerated() {
+    private func window(_ m: Moment) -> ClosedRange<Double> {
+        max(0, m.peak - 38)...min(duration, m.peak + 26)
+    }
+
+    private func runListen(_ ids: [UUID]) async {
+        for (n, id) in ids.enumerated() {
             if Task.isCancelled { return }
             guard let idx = moments.firstIndex(where: { $0.id == id }) else { continue }
-            analysisJob = Job(title: "Finding the story in each moment", detail: "\(n + 1) of \(targets.count)",
-                              progress: Double(n) / total)
+            analysisJob = Job(title: "Listening to the top moments", detail: "\(n + 1) of \(ids.count)",
+                              progress: Double(n) / Double(ids.count))
             moments[idx].stage = .listening
-            let m = moments[idx]
-            let win = max(0, m.peak - 38)...min(duration, m.peak + 26)
+            let win = window(moments[idx])
             do {
                 let raw = isCovered(win) ? sourceWords.filter { $0.start >= win.lowerBound && $0.end <= win.upperBound }
                                          : try await transcribe(win)
@@ -653,10 +743,7 @@ final class EditorModel {
                 return
             }
         }
-        if source == .loud { source = .best }
-        if hasAPIKey && !Task.isCancelled {
-            await aiFind(progressBase: Double(targets.count) / total, progressSpan: 1 / total)
-        }
+        show("Done · tap Ask AI to have an AI pick and cut them")
     }
 
     private func runDeepScan() async {
@@ -665,33 +752,25 @@ final class EditorModel {
         var spans: [ClosedRange<Double>] = []
         while t < duration { spans.append(t...min(duration, t + chunk)); t += chunk }
         let todo = spans.filter { !isCovered($0) }
-        let aiShare = hasAPIKey ? 0.1 : 0
         for (n, r) in todo.enumerated() {
             if Task.isCancelled { return }
-            analysisJob = Job(title: "Deep scan: transcribing the whole video",
+            analysisJob = Job(title: "Deep scan: transcribing everything",
                               detail: "\(clock(r.lowerBound)) of \(clock(duration))",
-                              progress: (1 - aiShare) * Double(n) / Double(max(todo.count, 1)))
+                              progress: Double(n) / Double(max(todo.count, 1)))
             do { _ = try await transcribe(r) } catch {
                 show("Transcription failed: \(error.localizedDescription)")
                 return
             }
         }
-        // re-shape the loud moments now that the whole transcript is known
         for i in moments.indices where moments[i].stage != .ai {
-            let m = moments[i]
-            let win = max(0, m.peak - 38)...min(duration, m.peak + 26)
+            let win = window(moments[i])
             shapeLoud(i, words: sourceWords.filter { $0.start >= win.lowerBound && $0.end <= win.upperBound }, window: win)
         }
-        if hasAPIKey && !Task.isCancelled {
-            await aiFind(progressBase: 1 - aiShare, progressSpan: aiShare)
-        } else {
-            addSpeechMoments()
-            source = .best
-            show("Deep scan done · add a Claude key for smarter picks")
-        }
+        addSpeechMoments()
+        show("Deep scan done")
     }
 
-    /// Cuts a loud moment at sentence boundaries and scores what was said.
+    /// Cuts a moment at sentence boundaries and scores what was said.
     private func shapeLoud(_ i: Int, words raw: [RawWord], window win: ClosedRange<Double>) {
         var u = moments[i]
         let (s, e) = ShortShaper.shape(peak: u.peak, words: raw, window: win, duration: duration)
@@ -700,7 +779,7 @@ final class EditorModel {
         u.text = TextScorer.score(words: inClip, duration: e - s)
         u.transcript = inClip.map { Transliterator.roman($0.text) }.joined(separator: " ")
         let peakLine = ShortShaper.lines(raw).first { $0.start <= u.peak + 1 && $0.end >= u.peak - 1 }
-        if u.title.isEmpty, let pl = peakLine {
+        if let pl = peakLine, ["Loud moment", "Chat went off", "Most replayed", ""].contains(u.title) {
             u.title = "“" + pl.text.split(separator: " ").prefix(5).joined(separator: " ") + "”"
         }
         u.stage = .shaped
@@ -708,7 +787,7 @@ final class EditorModel {
         if selectedID == u.id { setTrim(u.start, u.end, resetDetail: true) }
     }
 
-    /// Without Claude: the most excited-sounding stretches of speech that are not already a moment.
+    /// After a deep scan: the most excited-sounding stretches of speech that are not already a moment.
     private func addSpeechMoments() {
         let words = sourceWords
         guard words.count > 20 else { return }
@@ -736,70 +815,96 @@ final class EditorModel {
 
     /// 0...1: how loud this stretch is compared with the whole video.
     private func loudScore(_ r: ClosedRange<Double>) -> Float {
-        guard !bins.isEmpty else { return 0 }
+        guard !wave.isEmpty else { return 0 }
         let a = max(0, Int(r.lowerBound / AudioAnalyzer.binSeconds))
-        let b = min(bins.count - 1, Int(r.upperBound / AudioAnalyzer.binSeconds))
+        let b = min(wave.count - 1, Int(r.upperBound / AudioAnalyzer.binSeconds))
         guard a <= b else { return 0 }
-        let lv = AudioAnalyzer.levels(bins: bins).norm
-        return lv[a...b].reduce(0, +) / Float(b - a + 1)
+        return wave[a...b].reduce(0, +) / Float(b - a + 1)
     }
 
-    /// Per-second loudness z-scores (PeakCut's loud_zscore), used to mark (LOUD) lines for Claude.
-    private func loudZ() -> [Float] {
-        let perSec = Int(1 / AudioAnalyzer.binSeconds)
-        var secs: [Float] = []
-        var i = 0
-        while i < bins.count { secs.append(bins[i..<min(bins.count, i + perSec)].max() ?? -60); i += perSec }
-        guard secs.count >= 5 else { return [Float](repeating: 0, count: secs.count) }
-        let median = secs.sorted()[secs.count / 2]
-        let mean = secs.reduce(0, +) / Float(secs.count)
-        let sd = sqrt(secs.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Float(secs.count))
-        return secs.map { ($0 - median) / (sd + 1e-6) }
-    }
+    // MARK: AI (copy-paste, or sent with a key)
 
-    /// Claude reads everything transcribed so far and returns clips with start/end, hook, title, post text and
-    /// punch words. They replace the moments they overlap.
-    func aiFind(progressBase: Double = 0, progressSpan: Double = 1) async {
-        let key = UserDefaults.standard.string(forKey: "anthropicKey") ?? ""
-        guard !key.isEmpty else { show("Add your Claude API key in Settings"); return }
-        let words = sourceWords.sorted { $0.start < $1.start }
-        let z = loudZ()
-        let lines = ShortShaper.lines(words, gap: 0.7).map { l -> ClaudeRanker.Line in
-            let a = max(0, Int(l.start)), b = min(z.count - 1, Int(l.end))
-            let loud = a <= b && (z[a...b].max() ?? 0) > 1.5
-            return ClaudeRanker.Line(start: l.start, end: l.end, text: l.text, loud: loud)
-        }
-        guard lines.count >= 3 else { show("Not enough speech to analyse yet"); return }
-        analysisJob = Job(title: "Claude is picking the shorts", detail: "context, hooks, titles", progress: progressBase)
-        do {
-            let clips = try await ClaudeRanker.findClips(
-                lines: lines, words: words, duration: duration, title: videoTitle, channel: channel,
-                maxClips: 12, minLen: 15, maxLen: 60, apiKey: key,
-                progress: { [weak self] p in self?.analysisJob?.progress = progressBase + progressSpan * p })
-            guard !clips.isEmpty else { show("Claude found nothing worth clipping here"); return }
-            var keep = moments.filter { m in !clips.contains { min(m.end, $0.end) - max(m.start, $0.start) > 0.3 * m.duration } }
-            for c in clips {
-                var m = Moment(start: c.start, end: c.end, peak: peakTime(in: c.start...c.end), loud: loudScore(c.start...c.end))
-                let inClip = words.filter { $0.start >= c.start && $0.end <= c.end }
-                m.text = TextScorer.score(words: inClip, duration: c.end - c.start)
-                m.ai = c.score
-                m.title = c.title
-                m.hook = c.hook
-                m.reason = c.reason
-                m.category = c.category
-                m.postTitle = c.title
-                m.postText = c.description + (c.hashtags.isEmpty ? "" : "\n\n" + c.hashtags.map { "#" + $0 }.joined(separator: " "))
-                m.highlights = c.highlights
-                m.transcript = inClip.map { Transliterator.roman($0.text) }.joined(separator: " ")
-                m.stage = .ai
-                keep.append(m)
+    /// Builds one prompt about the top moments: what was said (if transcribed) and what chat spammed.
+    func askAIForMoments() {
+        let top = Array(visibleMoments.prefix(15))
+        guard !top.isEmpty else { show("No moments yet"); return }
+        var cands: [AIBridge.Candidate] = []
+        var windows: [Int: ClosedRange<Double>] = [:]
+        var ids: [Int: UUID] = [:]
+        let z = wave
+        for (n, m) in top.enumerated() {
+            let win = window(m)
+            let words = sourceWords.filter { $0.start >= win.lowerBound && $0.end <= win.upperBound }
+            let lines = ShortShaper.lines(words, gap: 0.7).map { l -> (Double, String, Bool) in
+                let a = max(0, Int(l.start / AudioAnalyzer.binSeconds)), b = min(z.count - 1, Int(l.end / AudioAnalyzer.binSeconds))
+                return (l.start, l.text, a <= b && (z[a...b].max() ?? 0) > 0.85)
             }
-            moments = keep
+            cands.append(.init(id: n, from: win.lowerBound, to: win.upperBound, peak: m.peak,
+                               transcript: lines, chat: m.chatSample, loud: m.loud))
+            windows[n] = win
+            ids[n] = m.id
+        }
+        if cands.allSatisfy({ $0.transcript.isEmpty && $0.chat.isEmpty }) {
+            show("Tip: tap Listen first, so the AI knows what was said")
+        }
+        aiRequest = AIRequest(kind: .moments, prompt: AIBridge.momentsPrompt(cands, title: videoTitle, channel: channel),
+                              windows: windows, momentIDs: ids)
+    }
+
+    /// Applies a pasted (or sent) AI answer. Returns an error message to show, or nil when it worked.
+    func applyAI(_ reply: String, for req: AIRequest) -> String? {
+        switch req.kind {
+        case .captions:
+            return applyCaptionAnswer(reply, req)
+        case .moments:
+            guard let picks = AIBridge.parseMoments(reply, windows: req.windows) else {
+                return "Couldn't find the JSON list in that answer. Copy the AI's whole reply and paste it here."
+            }
+            guard !picks.isEmpty else { return "The AI didn't keep any moment. Try another part of the stream." }
+            for p in picks {
+                guard let id = req.momentIDs[p.id], let i = moments.firstIndex(where: { $0.id == id }) else { continue }
+                var s = p.start, e = p.end
+                let words = sourceWords.filter { $0.start >= s - 5 && $0.end <= e + 12 }
+                if words.count > 5, let r = ShortShaper.snap(start: s, end: e, words: words, minLen: 12, maxLen: 70, duration: duration) {
+                    (s, e) = r
+                } else {
+                    s = AudioAnalyzer.nearestPause(bins: bins, t: s, within: 1.5)
+                    e = AudioAnalyzer.nearestPause(bins: bins, t: e, within: 1.5)
+                }
+                var m = moments[i]
+                m.start = s; m.end = max(e, s + 8)
+                m.ai = p.score
+                m.title = p.title.isEmpty ? m.title : p.title
+                m.hook = p.hook
+                m.reason = p.reason
+                m.category = p.category
+                m.postTitle = p.title
+                m.postText = p.description + (p.hashtags.isEmpty ? "" : "\n\n" + p.hashtags.map { "#" + $0 }.joined(separator: " "))
+                m.highlights = p.highlights
+                m.stage = .ai
+                moments[i] = m
+            }
+            // moments the AI skipped drop down the list
+            let kept = Set(picks.compactMap { req.momentIDs[$0.id] })
+            for (_, id) in req.momentIDs where !kept.contains(id) {
+                if let i = moments.firstIndex(where: { $0.id == id }) { moments[i].ai = 0 }
+            }
             source = .best
             if let top = visibleMoments.first { select(top) }
-            show("Claude picked \(clips.count) shorts")
+            show("AI picked \(picks.count) shorts")
+            return nil
+        }
+    }
+
+    /// Sends the prompt with the user's own Claude API key instead of copy-paste.
+    func sendAI(_ req: AIRequest) async -> String? {
+        let key = UserDefaults.standard.string(forKey: "anthropicKey") ?? ""
+        guard !key.isEmpty else { return "Add a Claude API key in Settings, or copy the prompt instead." }
+        do {
+            let reply = try await AIBridge.send(prompt: req.prompt, apiKey: key)
+            return applyAI(reply, for: req)
         } catch {
-            show("Claude failed: \(error.localizedDescription)")
+            return error.localizedDescription
         }
     }
 
@@ -838,6 +943,7 @@ final class EditorModel {
             picked = []
             exportJob = nil
             exportTask = nil
+            await transcriber.unload()
             show("\(ok) of \(list.count) shorts saved to Photos")
         }
     }
@@ -853,6 +959,7 @@ final class EditorModel {
         let detail = count > 1 ? "\(index + 1) of \(count)" : ""
         exportJob = Job(title: label, detail: detail, progress: Double(index) / Double(count))
         do {
+            await coolDown { [weak self] msg in self?.exportJob?.detail = msg }
             if style.captionsOn, !isCovered(s...e) {
                 exportJob?.title = "Transcribing"
                 _ = try await transcribe(s...e)

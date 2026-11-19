@@ -10,6 +10,15 @@ enum StreamSources {
         let channel: String
         let live: Bool
         let isTwitch: Bool
+        var vodID: String? = nil          // Twitch VOD: for the chat replay
+        var login: String? = nil          // Twitch live: for live chat
+        var kickChatroom: Int? = nil      // Kick live: for live chat
+    }
+
+    /// The downloaded file, and where it starts in the original video (for lining up chat).
+    struct Downloaded {
+        let file: URL
+        let offset: Double
     }
 
     struct Options {
@@ -103,7 +112,8 @@ enum StreamSources {
             let m = await meta("query { video(id: \"\(id)\") { title owner { displayName } } }")
             let v = m["video"] as? [String: Any]
             return Source(master: c.url!, title: v?["title"] as? String ?? "",
-                          channel: (v?["owner"] as? [String: Any])?["displayName"] as? String ?? "", live: false, isTwitch: true)
+                          channel: (v?["owner"] as? [String: Any])?["displayName"] as? String ?? "", live: false, isTwitch: true,
+                          vodID: id)
         }
 
         static func live(_ login: String) async throws -> Source {
@@ -115,7 +125,7 @@ enum StreamSources {
             let m = await meta("query { user(login: \"\(login)\") { displayName broadcastSettings { title } } }")
             let u = m["user"] as? [String: Any]
             return Source(master: c.url!, title: (u?["broadcastSettings"] as? [String: Any])?["title"] as? String ?? "",
-                          channel: u?["displayName"] as? String ?? login, live: true, isTwitch: true)
+                          channel: u?["displayName"] as? String ?? login, live: true, isTwitch: true, login: login)
         }
     }
 
@@ -137,7 +147,9 @@ enum StreamSources {
             }
             let ls = j["livestream"] as? [String: Any]
             let user = (j["user"] as? [String: Any])?["username"] as? String
-            return Source(master: url, title: ls?["session_title"] as? String ?? "", channel: user ?? slug, live: true, isTwitch: false)
+            let room = (j["chatroom"] as? [String: Any])?["id"] as? Int
+            return Source(master: url, title: ls?["session_title"] as? String ?? "", channel: user ?? slug, live: true, isTwitch: false,
+                          kickChatroom: room)
         }
     }
 
@@ -256,7 +268,7 @@ enum StreamSources {
 
     /// Downloads the stream (or the asked-for part of it) into an MP4 on the phone.
     static func download(_ src: Source, options o: Options,
-                         onStatus: @escaping @MainActor (String, Double?) -> Void) async throws -> URL {
+                         onStatus: @escaping @MainActor (String, Double?) -> Void) async throws -> Downloaded {
         await onStatus("Finding the stream", nil)
         let masterText = String(decoding: try await get(src.master), as: UTF8.self)
         var mediaURL = src.master
@@ -268,7 +280,8 @@ enum StreamSources {
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("stream-\(UUID().uuidString.prefix(8)).mp4")
 
         if src.live {
-            return try await recordLive(mediaURL, minutes: o.liveMinutes, twitch: src.isTwitch, out: out, onStatus: onStatus)
+            let f = try await recordLive(mediaURL, minutes: o.liveMinutes, twitch: src.isTwitch, out: out, onStatus: onStatus)
+            return Downloaded(file: f, offset: 0)
         }
 
         let pl = media(String(decoding: try await get(mediaURL), as: UTF8.self), base: mediaURL, skipAds: src.isTwitch)
@@ -276,6 +289,7 @@ enum StreamSources {
         if let from = o.from { segs = segs.filter { $0.start + $0.duration > from } }
         if let to = o.to { segs = segs.filter { $0.start < to } }
         guard !segs.isEmpty else { throw err("Nothing to download in that time range.") }
+        let offset = segs[0].start
 
         let label = "Downloading on your phone"
         if let map = pl.map {
@@ -287,7 +301,7 @@ enum StreamSources {
                 try h.seekToEnd(); try h.write(contentsOf: data)
                 await onStatus(label, Double(n + 1) / Double(segs.count))
             }
-            return out
+            return Downloaded(file: out, offset: offset)
         }
 
         let remux = TSRemuxer(output: out)
@@ -297,7 +311,7 @@ enum StreamSources {
                 await onStatus(label, Double(n + 1) / Double(segs.count))
             }
             await onStatus("Finishing the video", nil)
-            return try await remux.finish()
+            return Downloaded(file: try await remux.finish(), offset: offset)
         } catch {
             remux.cancel()
             throw error

@@ -1,7 +1,7 @@
 import Foundation
 
 enum MomentStage: Equatable {
-    case loud            // found from audio energy only
+    case loud            // found from loudness / chat / replays, not listened to yet
     case listening       // transcription running
     case shaped          // transcribed + cut to sentence boundaries
     case ai              // picked/cut by Claude
@@ -13,6 +13,9 @@ struct Moment: Identifiable, Equatable {
     var end: Double
     var peak: Double                 // loudest instant (source time)
     var loud: Float                  // 0...1, from audio energy
+    var chat: Float? = nil           // 0...1, how hard the live chat reacted (Twitch/Kick)
+    var heat: Float? = nil           // 0...1, YouTube "most replayed"
+    var chatSample: [String] = []    // what chat was spamming
     var text: Float? = nil           // 0...1, from the transcript
     var ai: Float? = nil             // 0...1, from Claude
     var transcript: String = ""      // Hinglish, for display
@@ -28,10 +31,16 @@ struct Moment: Identifiable, Equatable {
 
     var duration: Double { end - start }
 
+    /// Every signal that exists for this moment, averaged. Chat and "most replayed" are what real viewers did,
+    /// so they count more than loudness. An AI score, when there is one, leads.
     var combined: Float {
-        if let ai { return 0.6 * ai + 0.2 * loud + 0.2 * (text ?? 0) }
-        if let text { return 0.5 * loud + 0.5 * text }
-        return loud
+        var sum = loud, weight: Float = 1
+        if let chat { sum += 1.5 * chat; weight += 1.5 }
+        if let heat { sum += 1.5 * heat; weight += 1.5 }
+        if let text { sum += text; weight += 1 }
+        let base = sum / weight
+        if let ai { return 0.6 * ai + 0.4 * base }
+        return base
     }
 }
 

@@ -14,8 +14,33 @@ enum LinkImporter {
         if StreamSources.supported(link) {
             await onStatus("Opening the stream", nil)
             let src = try await StreamSources.resolve(link)
-            let file = try await StreamSources.download(src, options: options, onStatus: onStatus)
-            return Result(file: file, title: src.title, channel: src.channel)
+            // chat: replay for VODs (fetched while the video downloads), live chat while recording
+            let live = LiveChatRecorder()
+            if src.live {
+                if let login = src.login { live.startTwitch(login) }
+                if let room = src.kickChatroom { live.startKick(chatroom: room) }
+            }
+            var replay: Task<[ChatMessage], Never>?
+            if let id = src.vodID {
+                let from = options.from ?? 0, to = options.to
+                replay = Task { await ChatSignal.twitchVOD(id: id, from: from, to: to, onProgress: { _ in }) }
+            }
+            let dl: StreamSources.Downloaded
+            do {
+                dl = try await StreamSources.download(src, options: options, onStatus: onStatus)
+            } catch {
+                live.stop(); replay?.cancel()
+                throw error
+            }
+            live.stop()
+            var chat = live.messages
+            if let replay {
+                await onStatus("Reading the chat replay", nil)
+                // replay times start at `from`; the file starts at the first segment, a few seconds earlier
+                let shift = (options.from ?? 0) - dl.offset
+                chat = await replay.value.map { ChatMessage(t: $0.t + shift, text: $0.text) }
+            }
+            return Result(file: dl.file, title: src.title, channel: src.channel, chat: chat)
         }
         if isYouTube(link) {
             guard configured else {
@@ -30,6 +55,8 @@ enum LinkImporter {
         let file: URL
         let title: String
         let channel: String
+        var chat: [ChatMessage] = []
+        var heat: [Float] = []          // YouTube "most replayed", per second, 0...1
     }
 
     static var address: String { (UserDefaults.standard.string(forKey: "helperURL") ?? "").trimmingCharacters(in: .whitespaces) }
@@ -79,11 +106,23 @@ enum LinkImporter {
         guard let id = start["id"] as? String else { throw err("The helper did not start the download.") }
 
         var title = "", channel = ""
+        var heat: [Float] = []
         while true {
             try Task.checkCancellation()
             let j = try await json(try request("jobs/\(id)"))
             title = j["title"] as? String ?? title
             channel = j["uploader"] as? String ?? channel
+            if heat.isEmpty, let hm = j["heatmap"] as? [[String: Any]], !hm.isEmpty {
+                // YouTube's "most replayed" graph: [{start_time, end_time, value}] -> per second
+                let end = hm.compactMap { $0["end_time"] as? Double }.max() ?? 0
+                var per = [Float](repeating: 0, count: max(1, Int(end.rounded(.up))))
+                for h in hm {
+                    let a = Int((h["start_time"] as? Double) ?? 0), b = Int(((h["end_time"] as? Double) ?? 0).rounded(.up))
+                    let v = Float((h["value"] as? Double) ?? 0)
+                    for i in max(0, a)..<min(per.count, max(a, b)) { per[i] = v }
+                }
+                heat = per
+            }
             let p = (j["progress"] as? Double) ?? 0
             switch j["state"] as? String ?? "" {
             case "ready":
@@ -110,7 +149,7 @@ enum LinkImporter {
         try await Downloader(onProgress: { p in Task { @MainActor in onStatus("Copying to your phone", 0.6 + 0.4 * p) } })
             .download(r, to: dest)
         _ = try? await json(try request("jobs/\(id)", method: "DELETE"))
-        return Result(file: dest, title: title, channel: channel)
+        return Result(file: dest, title: title, channel: channel, heat: heat)
     }
 
     private static func err(_ m: String) -> NSError {

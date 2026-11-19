@@ -24,6 +24,12 @@ struct MomentsPanel: View {
                 }
             }
 
+            if model.hot {
+                HStack(spacing: 6) {
+                    Image(systemName: "thermometer.sun.fill").foregroundStyle(Theme.hot)
+                    Text("Phone is hot. Heavy work is paused until it cools down.").font(.system(size: 12))
+                }
+            }
             if let job = model.analysisJob {
                 JobRow(job: job, onCancel: { model.cancelAnalysis() })
             } else if model.selecting {
@@ -40,14 +46,16 @@ struct MomentsPanel: View {
                 }
             } else {
                 HStack(spacing: 8) {
-                    Chip(title: "Deep scan", icon: "text.magnifyingglass", selected: false) { model.deepScan() }
-                    Chip(title: model.hasAPIKey ? "Claude picks" : "Add Claude", icon: "sparkles", selected: false) {
-                        if model.hasAPIKey {
-                            Task { await model.aiFind(); model.analysisJob = nil }
-                        } else {
-                            onSettings()
-                        }
+                    Chip(title: "Listen top 5", icon: "waveform", selected: false) { model.listenTop(5) }
+                    Chip(title: "Ask AI", icon: "sparkles", selected: false) { model.askAIForMoments() }
+                    Menu {
+                        Button("Deep scan (heavy, transcribes everything)", systemImage: "text.magnifyingglass") { model.deepScan() }
+                    } label: {
+                        Image(systemName: "ellipsis").font(.system(size: 14, weight: .bold))
+                            .frame(width: 32, height: 32)
+                            .background(Theme.raised, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                     }
+                    .foregroundStyle(.white)
                     Spacer()
                     if let m = model.selectedMoment, !m.postText.isEmpty || !m.postTitle.isEmpty {
                         Button { model.copyPostText(m) } label: {
@@ -60,7 +68,7 @@ struct MomentsPanel: View {
 
             let list = model.visibleMoments
             if list.isEmpty {
-                Text(model.analysisJob != nil ? "Listening to the stream… cards appear as they're ready."
+                Text(model.analysisJob != nil ? "Listening… cards appear as they're ready."
                                               : "No moments yet.")
                     .font(.system(size: 12)).foregroundStyle(Theme.dim)
                 Spacer(minLength: 0)
@@ -103,7 +111,7 @@ struct MomentCard: View {
                 }
                 Text(m.title.isEmpty ? "Loud moment" : m.title)
                     .font(.system(size: 13, weight: .bold)).lineLimit(1)
-                Text(m.reason.isEmpty ? (m.transcript.isEmpty ? " " : m.transcript) : m.reason)
+                Text(subtitle)
                     .font(.system(size: 11)).foregroundStyle(Theme.dim).lineLimit(2)
                     .multilineTextAlignment(.leading)
                 Spacer(minLength: 0)
@@ -134,9 +142,18 @@ struct MomentCard: View {
         .buttonStyle(.plain)
     }
 
+    /// What happened, from the best thing we know: the AI's reason, what was said, or what chat spammed.
+    private var subtitle: String {
+        if !m.reason.isEmpty { return m.reason }
+        if !m.transcript.isEmpty { return m.transcript }
+        if !m.chatSample.isEmpty { return "💬 " + m.chatSample.prefix(3).joined(separator: " · ") }
+        return " "
+    }
+
     @ViewBuilder private var stageIcon: some View {
         switch m.stage {
-        case .loud: Image(systemName: "speaker.wave.3.fill").foregroundStyle(Theme.faint)
+        case .loud: Image(systemName: m.chat != nil && (m.chat ?? 0) > m.loud ? "bubble.left.and.bubble.right.fill" : "speaker.wave.3.fill")
+            .foregroundStyle(Theme.faint)
         case .listening: PulseDot()
         case .shaped: Image(systemName: "text.quote").foregroundStyle(Theme.dim)
         case .ai: Image(systemName: "sparkles").foregroundStyle(Theme.accent)
@@ -249,7 +266,7 @@ struct CaptionsPanel: View {
                             .foregroundStyle(.white)
                         }
                         Spacer()
-                        Toggle("Accurate", isOn: Binding(get: { model.accurateModel },
+                        Toggle("Accurate (warmer)", isOn: Binding(get: { model.accurateModel },
                                                           set: { model.accurateModel = $0; model.captionsChanged() }))
                             .fixedSize().font(.system(size: 13)).tint(Theme.accent)
                     }

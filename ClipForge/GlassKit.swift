@@ -209,7 +209,7 @@ struct SettingsSheet: View {
                 } header: {
                     Text("Claude API key (optional)")
                 } footer: {
-                    Text("Turns on: Claude picking and cutting the shorts with proper context, hooks, post titles and hashtags, and caption fixes. Only transcript text is sent to api.anthropic.com, never video or audio. Typical cost is well under one US cent per stream with Claude Haiku. The key stays on this phone.")
+                    Text("Optional. Without a key, \"Ask AI\" gives you a prompt to paste into any free AI chat (ChatGPT, Claude, Gemini). With a key, the app can send that same prompt itself. Only text is sent, never video or audio. The key stays on this phone.")
                 }
                 Section {
                     TextField("http://192.168.1.5:8790", text: $helperURL)

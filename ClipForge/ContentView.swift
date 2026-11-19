@@ -24,6 +24,7 @@ struct ContentView: View {
     @State private var showFiles = false
     @State private var showSettings = false
     @State private var showLink = false
+    @Environment(\.scenePhase) private var scenePhase
     @State private var tab: EditorTab = .moments
 
     var body: some View {
@@ -90,6 +91,12 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showSettings) { SettingsSheet() }
+        .sheet(item: Binding(get: { model.aiRequest }, set: { model.aiRequest = $0 })) { req in
+            AISheet(request: req, model: model)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { model.pauseForBackground() }
+        }
         .sheet(isPresented: $showLink) {
             LinkSheet(onStart: { link, options in model.importLink(link, options: options) },
                       onSettings: { DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showSettings = true } })
