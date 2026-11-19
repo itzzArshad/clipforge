@@ -1,7 +1,7 @@
 import Foundation
 
 enum MomentStage: Equatable {
-    case loud            // found from audio energy only
+    case loud            // found from loudness / chat / replays, not listened to yet
     case listening       // transcription running
     case shaped          // transcribed + cut to sentence boundaries
     case ai              // picked/cut by Claude
@@ -13,21 +13,34 @@ struct Moment: Identifiable, Equatable {
     var end: Double
     var peak: Double                 // loudest instant (source time)
     var loud: Float                  // 0...1, from audio energy
+    var chat: Float? = nil           // 0...1, how hard the live chat reacted (Twitch/Kick)
+    var heat: Float? = nil           // 0...1, YouTube "most replayed"
+    var chatSample: [String] = []    // what chat was spamming
     var text: Float? = nil           // 0...1, from the transcript
     var ai: Float? = nil             // 0...1, from Claude
     var transcript: String = ""      // Hinglish, for display
     var title: String = ""           // short label for the card
     var hook: String = ""            // on-screen hook for the first seconds
     var reason: String = ""
+    var category: String = ""
+    var postTitle: String = ""          // for the upload, not the video
+    var postText: String = ""           // description + hashtags, ready to paste
+    var highlights: [String] = []       // words that carry the punch: drawn in the strong colour
     var stage: MomentStage = .loud
     var exported = false
 
     var duration: Double { end - start }
 
+    /// Every signal that exists for this moment, averaged. Chat and "most replayed" are what real viewers did,
+    /// so they count more than loudness. An AI score, when there is one, leads.
     var combined: Float {
-        if let ai { return 0.6 * ai + 0.2 * loud + 0.2 * (text ?? 0) }
-        if let text { return 0.5 * loud + 0.5 * text }
-        return loud
+        var sum = loud, weight: Float = 1
+        if let chat { sum += 1.5 * chat; weight += 1.5 }
+        if let heat { sum += 1.5 * heat; weight += 1.5 }
+        if let text { sum += text; weight += 1 }
+        let base = sum / weight
+        if let ai { return 0.6 * ai + 0.4 * base }
+        return base
     }
 }
 
@@ -99,6 +112,49 @@ enum ShortShaper {
         }
         flush()
         return out
+    }
+
+    /// The moments a sentence finishes: a word ending in . ? ! । ؟, or (when the transcript has little
+    /// punctuation) a pause in the talking. Ported from PeakCut's brain.sentence_ends.
+    static func sentenceEnds(_ words: [RawWord]) -> [Double] {
+        func ends(_ t: String) -> Bool {
+            guard let c = t.last else { return false }
+            return ".?!।؟".contains(c)
+        }
+        let punctuated = words.filter { ends($0.text) }.count >= max(2, words.count / 80)
+        var out: [Double] = []
+        for (i, w) in words.enumerated() {
+            let gap = i + 1 < words.count ? words[i + 1].start - w.end : 9
+            if (punctuated && ends(w.text)) || gap >= (punctuated ? 1.0 : 0.5) { out.append(w.end) }
+        }
+        return out
+    }
+
+    /// Start at the beginning of a line and end where a sentence ends, inside the allowed length. A clip that
+    /// stops mid-sentence feels cut off, so the sentence being said at the chosen end is finished; if that would
+    /// take too long, it ends at the sentence before. Ported from PeakCut's brain._snap.
+    static func snap(start s0: Double, end e0: Double, words: [RawWord],
+                     minLen: Double = ShortShaper.minLength, maxLen: Double = ShortShaper.maxLength, duration: Double) -> (Double, Double)? {
+        guard s0 >= 0, e0 > s0 else { return nil }
+        var s = s0, e = e0
+        let ls = lines(words, gap: 0.7)
+        let starts = ls.map(\.start).filter { abs($0 - s) <= 4 }
+        if let best = starts.min(by: { abs($0 - s) < abs($1 - s) }) { s = best }
+        let lo = s + minLen, hi = min(s + maxLen, duration)
+        let stops = sentenceEnds(words).filter { $0 >= lo && $0 <= hi }
+        if !stops.isEmpty {
+            let after = stops.filter { $0 >= e - 1.0 }
+            if let a = after.first, a - e <= 12 { e = a } else { e = stops.min(by: { abs($0 - e) < abs($1 - e) })! }
+        } else {
+            let ends = words.map(\.end).filter { $0 >= lo && $0 <= hi && abs($0 - e) <= 4 }
+            if let best = ends.min(by: { abs($0 - e) < abs($1 - e) }) { e = best }
+        }
+        e = max(e, s + minLen)
+        e = min(e, s + maxLen, duration)
+        // a short breath after the last word, but never into the next sentence
+        let next = words.first { $0.start > e - 0.01 }?.start
+        let tail = next == nil ? 0.35 : min(0.35, max(0.08, next! - e - 0.05))
+        return (max(0, s - 0.15), min(duration, e + tail))
     }
 
     /// Returns (start, end) in source time.

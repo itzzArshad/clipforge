@@ -24,6 +24,12 @@ struct MomentsPanel: View {
                 }
             }
 
+            if model.hot {
+                HStack(spacing: 6) {
+                    Image(systemName: "thermometer.sun.fill").foregroundStyle(Theme.hot)
+                    Text("Phone is hot. Heavy work is paused until it cools down.").font(.system(size: 12))
+                }
+            }
             if let job = model.analysisJob {
                 JobRow(job: job, onCancel: { model.cancelAnalysis() })
             } else if model.selecting {
@@ -40,22 +46,29 @@ struct MomentsPanel: View {
                 }
             } else {
                 HStack(spacing: 8) {
-                    Chip(title: "Re-analyse", icon: "waveform", selected: false) { model.analyzeSpeech() }
-                    Chip(title: model.hasAPIKey ? "Claude cut" : "Add Claude", icon: "sparkles", selected: false) {
-                        if model.hasAPIKey {
-                            model.analysisJob = Job(title: "Claude is cutting the shorts")
-                            Task { await model.aiPick(); model.analysisJob = nil }
-                        } else {
-                            onSettings()
-                        }
+                    Chip(title: "Listen top 5", icon: "waveform", selected: false) { model.listenTop(5) }
+                    Chip(title: "Ask AI", icon: "sparkles", selected: false) { model.askAIForMoments() }
+                    Menu {
+                        Button("Deep scan (heavy, transcribes everything)", systemImage: "text.magnifyingglass") { model.deepScan() }
+                    } label: {
+                        Image(systemName: "ellipsis").font(.system(size: 14, weight: .bold))
+                            .frame(width: 32, height: 32)
+                            .background(Theme.raised, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                     }
+                    .foregroundStyle(.white)
                     Spacer()
+                    if let m = model.selectedMoment, !m.postText.isEmpty || !m.postTitle.isEmpty {
+                        Button { model.copyPostText(m) } label: {
+                            Image(systemName: "doc.on.doc").font(.system(size: 14, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
+                    }
                 }
             }
 
             let list = model.visibleMoments
             if list.isEmpty {
-                Text(model.analysisJob != nil ? "Listening to the stream… cards appear as they're ready."
+                Text(model.analysisJob != nil ? "Listening… cards appear as they're ready."
                                               : "No moments yet.")
                     .font(.system(size: 12)).foregroundStyle(Theme.dim)
                 Spacer(minLength: 0)
@@ -98,7 +111,7 @@ struct MomentCard: View {
                 }
                 Text(m.title.isEmpty ? "Loud moment" : m.title)
                     .font(.system(size: 13, weight: .bold)).lineLimit(1)
-                Text(m.reason.isEmpty ? (m.transcript.isEmpty ? " " : m.transcript) : m.reason)
+                Text(subtitle)
                     .font(.system(size: 11)).foregroundStyle(Theme.dim).lineLimit(2)
                     .multilineTextAlignment(.leading)
                 Spacer(minLength: 0)
@@ -129,9 +142,18 @@ struct MomentCard: View {
         .buttonStyle(.plain)
     }
 
+    /// What happened, from the best thing we know: the AI's reason, what was said, or what chat spammed.
+    private var subtitle: String {
+        if !m.reason.isEmpty { return m.reason }
+        if !m.transcript.isEmpty { return m.transcript }
+        if !m.chatSample.isEmpty { return "💬 " + m.chatSample.prefix(3).joined(separator: " · ") }
+        return " "
+    }
+
     @ViewBuilder private var stageIcon: some View {
         switch m.stage {
-        case .loud: Image(systemName: "speaker.wave.3.fill").foregroundStyle(Theme.faint)
+        case .loud: Image(systemName: m.chat != nil && (m.chat ?? 0) > m.loud ? "bubble.left.and.bubble.right.fill" : "speaker.wave.3.fill")
+            .foregroundStyle(Theme.faint)
         case .listening: PulseDot()
         case .shaped: Image(systemName: "text.quote").foregroundStyle(Theme.dim)
         case .ai: Image(systemName: "sparkles").foregroundStyle(Theme.accent)
@@ -197,10 +219,8 @@ struct CaptionsPanel: View {
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Toggle("Captions", isOn: model.bind(\.captionsOn))
-                        .font(.system(size: 14, weight: .semibold)).tint(Theme.accent)
-                }
+                Toggle("Captions", isOn: model.bind(\.captionsOn))
+                    .font(.system(size: 14, weight: .semibold)).tint(Theme.accent)
                 if let job = model.captionJob { JobRow(job: job) }
 
                 if model.style.captionsOn {
@@ -208,13 +228,12 @@ struct CaptionsPanel: View {
                         get: { model.style.script },
                         set: { model.style.script = $0; model.state.style = model.style; model.captionsChanged() }))
 
-                    HStack(spacing: 8) {
-                        ForEach(CaptionStyleKind.allCases) { k in
-                            Chip(title: k.rawValue, selected: model.style.captionStyle == k) {
-                                model.style.captionStyle = k
-                                model.styleChanged()
-                            }
-                        }
+                    Segments(items: CaptionStyleKind.allCases, label: { $0.rawValue }, value: Binding(
+                        get: { model.style.captionStyle },
+                        set: { model.style.captionStyle = $0; model.state.style = model.style; model.captionsChanged() }))
+
+                    HStack(spacing: 10) {
+                        SectionLabel(text: "Spoken word")
                         Spacer()
                         ForEach(0..<CaptionRenderer.palette.count, id: \.self) { i in
                             Circle()
@@ -233,7 +252,7 @@ struct CaptionsPanel: View {
                             let p = model.captionPhrases()
                             if p.isEmpty { model.show("Transcribe the clip first") } else { editing = PhraseList(items: p) }
                         }
-                        Chip(title: "AI Hinglish", icon: "sparkles", selected: false) { model.aiFixCaptions() }
+                        Chip(title: "AI fix", icon: "sparkles", selected: false) { model.aiFixCaptions() }
                     }
 
                     HStack {
@@ -247,7 +266,7 @@ struct CaptionsPanel: View {
                             .foregroundStyle(.white)
                         }
                         Spacer()
-                        Toggle("Accurate", isOn: Binding(get: { model.accurateModel },
+                        Toggle("Accurate (warmer)", isOn: Binding(get: { model.accurateModel },
                                                           set: { model.accurateModel = $0; model.captionsChanged() }))
                             .fixedSize().font(.system(size: 13)).tint(Theme.accent)
                     }
@@ -392,8 +411,9 @@ struct FXPanel: View {
                 fx("Punch-in", "Zooms in when the streamer gets loud", \.punch)
                 fx("Retention bar", "Thin progress line along the top", \.progressBar)
                 fx("Hype meter", "Bar that follows the streamer's energy", \.hype)
+                fx("Hook stays on", "Keep the hook box on screen for the whole short", \.hookStays)
                 VStack(alignment: .leading, spacing: 4) {
-                    SectionLabel(text: "Hook · first 2.5 s")
+                    SectionLabel(text: "Hook")
                     HStack(spacing: 8) {
                         TextField("e.g. Ye banda pagal hai 😭", text: model.bind(\.hook))
                             .font(.system(size: 15, weight: .semibold))

@@ -11,10 +11,6 @@ enum ReelBackground: String, CaseIterable, Identifiable {
     case aura = "Aura", blur = "Blur", black = "Black"
     var id: String { rawValue }
 }
-enum CaptionStyleKind: String, CaseIterable, Identifiable {
-    case pill = "Pill", pop = "Pop", clean = "Clean"
-    var id: String { rawValue }
-}
 enum CaptionScript: String, CaseIterable, Identifiable {
     case hinglish = "Hinglish", native = "Native"
     var id: String { rawValue }
@@ -33,10 +29,11 @@ struct ReelStyle: Equatable {
     var progressBar = true              // retention bar along the top
 
     var captionsOn = true
-    var captionStyle: CaptionStyleKind = .pill
+    var captionStyle: CaptionStyleKind = .bounce
     var script: CaptionScript = .hinglish
     var accent = 0
     var hook = ""
+    var hookStays = true                // keep the hook on screen for the whole clip (PeakCut style)
 
     var watermarkOn = false
     var watermarkText = "@yourhandle"
@@ -226,15 +223,17 @@ final class ReelState {
         let env = sample(lv.env, t)
         let ext = src.extent
         var out: CIImage
-        var captionCenterY: CGFloat = 520 * k
-        var hookTop: CGFloat = H - 470 * k
+        // PeakCut's geometry (render.geometry), in Core Image's bottom-up coordinates
+        var captionCenterY: CGFloat = H - 1380 * k
+        var hookTop: CGFloat = H - 300 * k
+        let vertical = ext.height >= ext.width
 
         // slam timing
         var slamAge: Double? = nil
         if st.slam, let s = slam, t >= s.time, t < s.time + 0.95 { slamAge = t - s.time }
         let slamPunch: CGFloat = slamAge.map { CGFloat(max(0, 1 - $0 / 0.35)) } ?? 0
 
-        switch st.layout {
+        switch (vertical && st.layout == .fit) ? .fill : st.layout {
         case .stream:
             let topH = (H * CGFloat(st.camShare)).rounded()
             let gameRect = CGRect(x: 0, y: 0, width: W, height: H - topH)
@@ -255,8 +254,8 @@ final class ReelState {
             let seamH = (6 + 10 * CGFloat(env)) * k
             let seam = CGRect(x: 0, y: camRect.minY - seamH / 2, width: W, height: seamH)
             out = solid(seam, accentCI(st.accent, alpha: 0.55 + 0.45 * CGFloat(env))).composited(over: out)
-            captionCenterY = gameRect.maxY - 210 * k
-            hookTop = H - 300 * k
+            captionCenterY = gameRect.maxY - 260 * k
+            hookTop = gameRect.maxY - 110 * k
 
         case .fill:
             let zoom: CGFloat = 1 + (st.punch ? 0.10 * CGFloat(env * env) : 0) + 0.06 * slamPunch
@@ -267,8 +266,7 @@ final class ReelState {
             let bg = background(src, kind: st.background, W: W, H: H, k: k)
             let sf = min(W / ext.width, H / ext.height) * zoom
             let fw = ext.width * sf, fh = ext.height * sf
-            let shift: CGFloat = fh < H * 0.8 ? 90 * k : 0
-            let rect = CGRect(x: (W - fw) / 2, y: (H - fh) / 2 + shift, width: fw, height: fh)
+            let rect = CGRect(x: (W - fw) / 2, y: (H - fh) / 2, width: fw, height: fh)
             let fg = src.transformed(by: CGAffineTransform(scaleX: sf, y: sf)
                 .concatenating(CGAffineTransform(translationX: rect.minX - ext.minX * sf, y: rect.minY - ext.minY * sf)))
             if fw < W - 1 || fh < H - 1,
@@ -279,7 +277,9 @@ final class ReelState {
             } else {
                 out = fg.composited(over: bg)
             }
-            captionCenterY = max(440 * k, rect.minY - 230 * k)
+            // hook above the video, captions below it
+            hookTop = min(H - 230 * k, rect.maxY + 190 * k)
+            captionCenterY = max(280 * k, rect.minY - 180 * k)
         }
 
         // hype meter (optional, sits above the bottom UI of Reels/Shorts)
@@ -326,7 +326,7 @@ final class ReelState {
 
         // hook sticker for the first 2.5 s
         let hook = st.hook.trimmingCharacters(in: .whitespaces)
-        if !hook.isEmpty && t < 2.5 {
+        if !hook.isEmpty && (st.hookStays || t < 2.5) {
             let img = cached("hook") { CaptionRenderer.hook(hook, accent: st.accent) }
             let intro = CGFloat(min(1, t / 0.18))
             let s = k * (0.85 + 0.15 * intro)
