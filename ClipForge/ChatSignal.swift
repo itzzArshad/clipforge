@@ -54,6 +54,30 @@ enum ChatSignal {
         return out
     }
 
+    /// The whole chat of a long VOD, read in parallel slices (a 10-hour stream in a minute or two instead of ten).
+    static func twitchVODAll(id: String, length: Double,
+                             onProgress: @escaping @MainActor (Double) -> Void) async -> [ChatMessage] {
+        let n = max(1, min(10, Int(length / 900) + 1))
+        let step = length / Double(n)
+        return await withTaskGroup(of: [ChatMessage].self) { g in
+            for i in 0..<n {
+                let a = Double(i) * step, b = a + step
+                g.addTask {
+                    await twitchVOD(id: id, from: a, to: b, onProgress: { _ in })
+                        .map { ChatMessage(t: $0.t + a, text: $0.text) }
+                }
+            }
+            var all: [ChatMessage] = []
+            var done = 0
+            for await part in g {
+                all += part
+                done += 1
+                await onProgress(Double(done) / Double(n))
+            }
+            return all.sorted { $0.t < $1.t }
+        }
+    }
+
     private static func post(_ body: Any) async throws -> [[String: Any]] {
         var r = URLRequest(url: URL(string: "https://gql.twitch.tv/gql")!)
         r.httpMethod = "POST"

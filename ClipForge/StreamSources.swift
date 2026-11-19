@@ -16,10 +16,41 @@ enum StreamSources {
         var kickChatroom: Int? = nil      // Kick live: for live chat
     }
 
-    /// The downloaded file, and where it starts in the original video (for lining up chat).
+    /// The downloaded file, and where it starts in the original video (for lining up chat). When only the best
+    /// parts were downloaded, `sections` says where each part sits in the file and in the original.
     struct Downloaded {
         let file: URL
         let offset: Double
+        var sections: [Section] = []
+    }
+
+    /// One downloaded part: `at`/`length` in the file, `peak` from the part's start, `srcStart` in the original.
+    struct Section {
+        let at: Double
+        let length: Double
+        let peak: Double
+        let srcStart: Double
+        var chat: [String] = []
+    }
+
+    /// A part of the original to fetch, around a peak.
+    struct Want {
+        let start: Double
+        let end: Double
+        let peak: Double
+    }
+
+    enum Mode: String, CaseIterable, Identifiable, Hashable {
+        case best, range, last, whole
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .best: return "Best parts"
+            case .range: return "From–To"
+            case .last: return "Last N min"
+            case .whole: return "Whole"
+            }
+        }
     }
 
     struct Options {
@@ -27,6 +58,9 @@ enum StreamSources {
         var from: Double? = nil
         var to: Double? = nil
         var liveMinutes = 30
+        var mode: Mode = .best
+        var count = 8
+        var wants: [Want] = []          // filled in for "best parts" once the peaks are known
     }
 
     enum Site { case twitchVOD(String), twitchLive(String), kickVOD(String), kickLive(String) }
@@ -115,6 +149,15 @@ enum StreamSources {
             return Source(master: c.url!, title: v?["title"] as? String ?? "",
                           channel: (v?["owner"] as? [String: Any])?["displayName"] as? String ?? "", live: false, isTwitch: true,
                           vodID: id)
+        }
+
+        /// A Twitch stream that is still live already has its VOD, growing as the stream goes on (unless the
+        /// streamer turned VODs off). Any earlier part of a live stream can be fetched from it.
+        static func recordingVOD(_ login: String) async -> String? {
+            let m = await meta("query { user(login: \"\(login)\") { videos(first: 1, type: ARCHIVE, sort: TIME) { edges { node { id status } } } } }")
+            let edges = (((m["user"] as? [String: Any])?["videos"] as? [String: Any])?["edges"] as? [[String: Any]]) ?? []
+            guard let node = edges.first?["node"] as? [String: Any], let id = node["id"] as? String else { return nil }
+            return (node["status"] as? String)?.uppercased() == "RECORDING" ? id : nil
         }
 
         static func live(_ login: String) async throws -> Source {
@@ -272,17 +315,27 @@ enum StreamSources {
 
     // MARK: downloading
 
+    /// The media playlist URL for the chosen quality.
+    static func mediaPlaylist(_ src: Source, maxHeight: Int) async throws -> URL {
+        let masterText = String(decoding: try await get(src.master), as: UTF8.self)
+        let vs = variants(masterText, base: src.master)
+        if vs.isEmpty { return src.master }
+        guard let v = pick(vs, maxHeight: maxHeight) else { throw err("This stream has no H.264 video the phone can use.") }
+        return v.url
+    }
+
+    /// How long a VOD is (for a VOD that is still recording: so far), from its playlist.
+    static func length(_ src: Source) async throws -> Double {
+        let u = try await mediaPlaylist(src, maxHeight: 360)
+        let pl = media(String(decoding: try await get(u), as: UTF8.self), base: u, skipAds: false)
+        return pl.segments.last.map { $0.start + $0.duration } ?? 0
+    }
+
     /// Downloads the stream (or the asked-for part of it) into an MP4 on the phone.
     static func download(_ src: Source, options o: Options,
                          onStatus: @escaping @MainActor (String, Double?) -> Void) async throws -> Downloaded {
         await onStatus("Finding the stream", nil)
-        let masterText = String(decoding: try await get(src.master), as: UTF8.self)
-        var mediaURL = src.master
-        let vs = variants(masterText, base: src.master)
-        if !vs.isEmpty {
-            guard let v = pick(vs, maxHeight: o.maxHeight) else { throw err("This stream has no H.264 video the phone can use.") }
-            mediaURL = v.url
-        }
+        let mediaURL = try await mediaPlaylist(src, maxHeight: o.maxHeight)
         let out = FileManager.default.temporaryDirectory.appendingPathComponent("stream-\(UUID().uuidString.prefix(8)).mp4")
 
         if src.live {
@@ -292,10 +345,37 @@ enum StreamSources {
 
         let pl = media(String(decoding: try await get(mediaURL), as: UTF8.self), base: mediaURL, skipAds: src.isTwitch)
         var segs = pl.segments
-        if let from = o.from { segs = segs.filter { $0.start + $0.duration > from } }
-        if let to = o.to { segs = segs.filter { $0.start < to } }
+        let total = segs.last.map { $0.start + $0.duration } ?? 0
+        var sections: [Section] = []
+        if !o.wants.isEmpty {
+            // only the parts around the peaks; each part starts on a new timeline so the file plays straight through
+            var chosen: [Segment] = []
+            var at = 0.0
+            for w in o.wants.sorted(by: { $0.start < $1.start }) {
+                var part = segs.filter { $0.start + $0.duration > w.start && $0.start < w.end && $0.start > (chosen.last?.start ?? -1) }
+                guard let first = part.first else { continue }
+                part[0].discontinuity = true
+                let len = part.reduce(0) { $0 + $1.duration }
+                sections.append(Section(at: at, length: len, peak: max(0, w.peak - first.start), srcStart: first.start))
+                at += len
+                chosen += part
+            }
+            segs = chosen
+            if pl.map != nil && sections.count > 1 {
+                throw err("This video's format can't be cut into parts on the phone. Use From–To instead.")
+            }
+        } else {
+            var from = o.from, to = o.to
+            if o.mode == .last { from = max(0, total - Double(o.liveMinutes) * 60); to = nil }
+            if o.mode == .whole { from = nil; to = nil }
+            if let from { segs = segs.filter { $0.start + $0.duration > from } }
+            if let to { segs = segs.filter { $0.start < to } }
+            if let from, from >= total, total > 0 {
+                throw err("The video is only \(Int(total / 60)) min long so far, so there's nothing at that time yet.")
+            }
+        }
         guard !segs.isEmpty else { throw err("Nothing to download in that time range.") }
-        let offset = segs[0].start
+        let offset = sections.isEmpty ? segs[0].start : 0
 
         let label = "Downloading on your phone"
         if let map = pl.map {
@@ -308,7 +388,7 @@ enum StreamSources {
                 await onStatus(label, Double(n + 1) / Double(segs.count))
             }
             await onStatus("Finishing the video", nil)
-            return Downloaded(file: try await checked(await TSRemuxer.normalize(out)), offset: offset)
+            return Downloaded(file: try await checked(await TSRemuxer.normalize(out)), offset: offset, sections: sections)
         }
 
         let remux = TSRemuxer(output: out)
@@ -320,7 +400,7 @@ enum StreamSources {
             }
             await onStatus("Finishing the video", nil)
             let raw = try await remux.finish()
-            return Downloaded(file: try await checked(await TSRemuxer.normalize(raw)), offset: offset)
+            return Downloaded(file: try await checked(await TSRemuxer.normalize(raw)), offset: offset, sections: sections)
         } catch {
             remux.cancel()
             throw error

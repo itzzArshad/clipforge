@@ -134,6 +134,7 @@ final class EditorModel {
     var chat: [ChatMessage] = []
     var chatCurve: [Float] = []
     var replays: [Float] = []
+    var sections: [StreamSources.Section] = []      // "best parts" downloads: where each part sits in the file
 
     // copy-paste AI
     var aiRequest: AIRequest?
@@ -262,7 +263,8 @@ final class EditorModel {
                 let r = try await LinkImporter.fetch(link, options: options) { [weak self] t, p in
                     self?.importJob = Job(title: t, progress: p)
                 }
-                await importVideo(r.file, title: r.title, channel: r.channel, chat: r.chat, replays: r.heat)
+                await importVideo(r.file, title: r.title, channel: r.channel, chat: r.chat, replays: r.heat,
+                                  sections: r.sections)
             } catch {
                 importJob = nil
                 show(error.localizedDescription)
@@ -271,7 +273,7 @@ final class EditorModel {
     }
 
     func importVideo(_ url: URL, title: String = "", channel: String = "",
-                     chat: [ChatMessage] = [], replays: [Float] = []) async {
+                     chat: [ChatMessage] = [], replays: [Float] = [], sections: [StreamSources.Section] = []) async {
         analysisTask?.cancel()
         analysisTask = nil
         analysisJob = nil
@@ -297,8 +299,9 @@ final class EditorModel {
             self.chat = chat
             chatCurve = ChatSignal.curve(chat, duration: duration)
             self.replays = replays.count > 10 ? replays : []
+            self.sections = sections
 
-            moments = findMoments()
+            moments = sections.isEmpty ? findMoments() : sectionMoments()
             source = .best
             if let first = visibleMoments.first {
                 select(first)
@@ -310,6 +313,7 @@ final class EditorModel {
             var found = "\(moments.count) moments"
             if !chatCurve.isEmpty { found += " · chat \(chat.count) msgs" }
             if !self.replays.isEmpty { found += " · most-replayed" }
+            if !sections.isEmpty { found = "\(moments.count) best parts" + (chat.isEmpty ? "" : " · chat \(chat.count) msgs") }
             show(found)
         } catch {
             show("Import failed: \(error.localizedDescription)")
@@ -342,6 +346,25 @@ final class EditorModel {
             }
             if !replays.isEmpty { m.heat = curveScore(replays, around: peak) }
             m.title = c.from == "chat" ? "Chat went off" : (c.from == "replay" ? "Most replayed" : "Loud moment")
+            out.append(m)
+        }
+        return out
+    }
+
+    /// One moment per downloaded part: setup before the peak, payoff after, cut on pauses, never across parts.
+    private func sectionMoments() -> [Moment] {
+        var out: [Moment] = []
+        for sec in sections {
+            let lo = sec.at, hi = min(duration, sec.at + sec.length)
+            guard hi - lo > 5 else { continue }
+            let peak = min(max(lo, sec.at + sec.peak), hi)
+            let s = min(max(lo, AudioAnalyzer.nearestPause(bins: bins, t: max(lo, peak - 18))), hi - 5)
+            let e = max(min(hi, AudioAnalyzer.nearestPause(bins: bins, t: min(hi, peak + 10))), min(hi, s + 12))
+            var m = Moment(start: s, end: e, peak: peak, loud: loudScore(s...e))
+            if !chatCurve.isEmpty { m.chat = curveScore(chatCurve, around: peak) }
+            m.chatSample = sec.chat.isEmpty ? ChatSignal.sample(chat, around: peak, limit: 12) : sec.chat
+            let h = Int(sec.srcStart + sec.peak)
+            m.title = "Part at \(h / 3600):\(String(format: "%02d", h % 3600 / 60)):\(String(format: "%02d", h % 60))"
             out.append(m)
         }
         return out
