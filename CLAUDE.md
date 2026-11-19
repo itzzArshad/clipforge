@@ -61,7 +61,7 @@ iPhone with Feather.
 - Two timelines: source time (original video) vs composition time (after silences are cut).
   Map with EditorModel.mapWords; transcripts are stored in source time.
 - Core Image uses a bottom-left origin. The renderer is designed at 1080x1920; everything scales by k = width / 1080
-  (preview renders at 540x960).
+  (preview renders at 432x768).
 - Never block the main thread with file copies or AVAssetReader loops.
 - Streams are usually Hindi/Hinglish; Whisper with language "hi" outputs Devanagari and sometimes Urdu script.
   Captions default to Roman Hinglish via Transliterator.roman.
